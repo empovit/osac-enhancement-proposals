@@ -3,7 +3,7 @@ title: cluster-upgrade-caas-phase1
 authors:
   - vemporop@redhat.com
 creation-date: 2026-09-22
-last-updated: 2026-09-30
+last-updated: 2026-10-04
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-1415
 prd:
@@ -63,7 +63,7 @@ Phase 1 adds two independent upgrade paths to the OSAC cluster API:
 1. **CP upgrade:** tenant PATCHes `spec.version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.ReleaseImage`; operator detects HC image divergence and patches `HostedCluster.spec.release.image`.
 2. **NP upgrade:** tenant PATCHes `spec.node_sets[<id>].version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage`; operator detects NP image divergence and patches the specific `NodePool.spec.release.image`.
 
-Both paths bypass AAP. The cluster's `CanUpgrade` condition is set to `False` on upgrade acceptance and restored to `True` when the operator confirms completion. The osac-operator monitors HyperShift status fields to detect completion and feeds results back to the fulfillment-service via the existing Signal RPC. The ClusterOrder phase is not changed during upgrade.
+Both paths bypass AAP. Fulfillment owns the `CanUpgrade` condition in its DB for initial HyperShift creation and upgrades: it sets `False` in the Cluster creation or upgrade-acceptance transaction and `True` in the transaction that records corresponding readiness or completion feedback. The osac-operator monitors HyperShift and reports status through the existing private Cluster Update path. The ClusterOrder phase is not changed during upgrade.
 
 ### Workflow Description
 
@@ -90,15 +90,15 @@ Cluster Reconciler (cluster_reconciler_function.go)
  ▼
 osac-operator (clusterorder_controller.go)
  │  HC image divergence → CP upgrade path
- │  Readiness check → PATCH HostedCluster.spec.release.image
+ │  PATCH HostedCluster.spec.release.image
  │  upgradeStatus.state = Pending
  ▼
 HyperShift Controller
  │  desired.version == target → upgradeStatus.state = Progressing
  │  history[0].state == Completed → upgradeStatus.state = Succeeded
  ▼
-Status Feedback (clusterorder_feedback_controller.go)
- │  upgradeStatus + CanUpgrade=True → Signal RPC → fulfillment-service DB
+Status Feedback (feedback_controller.go)
+ │  upgradeStatus → private Update → DB releases lock on completion
  ▼
 CLI / UI (upgrade state and observed version updated)
 ```
@@ -124,15 +124,15 @@ Cluster Reconciler (cluster_reconciler_function.go)
  ▼
 osac-operator (clusterorder_controller.go)
  │  NodePool[i] image divergence → NP upgrade path
- │  Readiness check → PATCH NodePool[i].spec.release.image
+ │  PATCH NodePool[i].spec.release.image
  │  upgradeStatus.state = Pending
  ▼
 HyperShift Controller
  │  conditions[UpdatingVersion]=True → upgradeStatus.state = Progressing
  │  UpdatingVersion=False + version==target → upgradeStatus.state = Succeeded
  ▼
-Status Feedback (clusterorder_feedback_controller.go)
- │  upgradeStatus + CanUpgrade=True + node_sets[i].observed_version → Signal RPC → fulfillment-service DB
+Status Feedback (feedback_controller.go)
+ │  upgradeStatus + observed_version → private Update → DB releases lock on completion
  ▼
 CLI / UI (upgrade state and observed version updated)
 ```
@@ -176,7 +176,7 @@ Resolve and validate the target `ClusterVersion` before locking the Cluster row.
 1. Reject `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
 2. Reject `FAILED_PRECONDITION` if `conditions[CAN_UPGRADE].status != True`. The error message includes the blocking reason from the condition.
 
-`PROGRESSING + CanUpgrade=True` passes both checks — AAP post-provisioning tasks may still be running, but the HC is at the requested version and a new upgrade can be accepted.
+`PROGRESSING + CanUpgrade=True` passes both checks — AAP post-provisioning tasks may still be running, but the Cluster `READY` condition has been reported and a new upgrade can be accepted.
 
 **`validateVersionUpdate` (CP) / `validateNPVersionUpdate` (NP)**:
 
@@ -218,7 +218,7 @@ On each reconcile, the operator compares desired vs. observed release images:
 - **CP:** `ClusterOrder.spec.ReleaseImage ≠ HostedCluster.spec.release.image` and HC exists → CP upgrade path.
 - **NP:** `ClusterOrder.spec.nodeRequests[i].ReleaseImage ≠ NodePool[i].spec.release.image` and NP exists → NP upgrade path for that pool.
 
-On divergence, the operator evaluates readiness (see [Operator upgrade readiness check](#operator-upgrade-readiness-check)). If not ready, it sets `upgradeStatus.message` with the blocking condition and requeues (`upgradeStatus.state` remains `Pending`). Once ready:
+The API accepted the upgrade only after checking the DB lock for the previous operation. On divergence, the operator patches the existing resource without waiting for HyperShift to match the newly requested target:
 
 - **CP:** `PATCH HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`
 - **NP:** `PATCH NodePool[i].spec.release.image = ClusterOrder.spec.nodeRequests[i].ReleaseImage`
@@ -234,7 +234,7 @@ After the HC or NP patch, the operator monitors for HyperShift's upgrade-started
 - **CP:** `HC.status.controlPlaneVersion.desired.version == target_version` → set `upgradeStatus.state = Progressing`, `startTime = now`.
 - **NP:** `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
 
-The feedback controller sends a Signal RPC on each `upgradeStatus` change, so the fulfillment-service reflects `Progressing` state promptly.
+The feedback controller sends each `upgradeStatus` change through the private Cluster Update path, so the fulfillment-service reflects `Progressing` state promptly.
 
 #### Step 6 — HyperShift Reconciliation
 
@@ -250,15 +250,14 @@ HyperShift's controllers perform the actual upgrade. The operator monitors for c
 
 #### Step 7 — Status Propagation (Feedback Loop)
 
-**Source file:** `osac-operator/internal/controller/clusterorder_feedback_controller.go`
+**Source file:** `osac-operator/internal/controller/feedback_controller.go`
 
 On completion, the operator updates `ClusterOrder.status`:
 1. Sets `upgradeStatus.state = Succeeded`, `upgradeStatus.completionTime = now`.
 2. Sets `ObservedVersion` from `HC.status.controlPlaneVersion.history[0].version` (CP) or records `node_sets[i].observed_version` in the feedback payload (NP).
-3. Sets `conditions[CanUpgrade] = True`.
-4. Appends an `UpgradeHistoryEntry`.
+3. Appends an `UpgradeHistoryEntry`.
 
-The feedback controller detects the `ClusterOrder.status` change and sends a `Signal` RPC to the fulfillment-service private API. The fulfillment-service persists `status.upgrade`, `status.observed_cp_version` (CP) or `status.node_sets[i].observed_version` (NP), and `conditions[CAN_UPGRADE] = True` to PostgreSQL.
+The feedback controller sends the status through the existing private Cluster Update path. Fulfillment persists `status.upgrade` and advances the observed CP or NP version on success. When feedback records `Succeeded` for the current component and target version, the same DB transaction sets `conditions[CAN_UPGRADE]=True`; feedback for an earlier target cannot release the lock. For initial cluster creation, fulfillment records cluster readiness (control plane and node pools) and sets `CanUpgrade=True` in one DB transaction while no upgrade is active. Incoming feedback cannot overwrite this DB-owned lock directly. The `Signal` RPC only queues reconciliation by cluster ID; it carries no status payload.
 
 ---
 
@@ -293,11 +292,10 @@ The feedback controller detects the `ClusterOrder.status` change and sends a `Si
 │         OSAC-OPERATOR  (clusterorder_controller.go)                 │
 │  1. Image divergence detected → upgrade path                        │
 │  2. upgradeStatus.state = Pending                                   │
-│  3. Readiness check → PATCH HC or NodePool spec.release.image       │
+│  3. PATCH HC or NodePool spec.release.image                          │
 │  4. Monitor: desired.version==target / UpdatingVersion=True         │
 │       → upgradeStatus.state = Progressing                           │
-│  5. Monitor completion criteria                                      │
-│       → upgradeStatus.state = Succeeded, CanUpgrade=True            │
+│  5. Monitor target completion → upgradeStatus.state = Succeeded     │
 └────────────────────────┬────────────────────────────────────────────┘
                          │ NodePool/HostedCluster status watch
                          ▼
@@ -309,10 +307,9 @@ The feedback controller detects the `ClusterOrder.status` change and sends a `Si
                          │ controller-runtime watch (ClusterOrder status)
                          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│      STATUS FEEDBACK  (clusterorder_feedback_controller.go)         │
-│  upgradeStatus.state=Succeeded, CanUpgrade=True,                    │
-│    observedVersion / node_sets[i].observed_version                  │
-│    → Signal RPC → fulfillment-service → PostgreSQL                  │
+│      STATUS FEEDBACK  (feedback_controller.go)                      │
+│  upgradeStatus + observed version → private Cluster Update          │
+│  DB stores result and sets CanUpgrade=True on completion            │
 └─────────────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -335,7 +332,7 @@ stateDiagram-v2
 
 **Upgrade does not change ClusterOrder state.** The ClusterOrder state (`PROGRESSING`, `READY`) reflects provisioning status; it is not changed when an upgrade is accepted or completed. The upgrade is tracked exclusively via the `upgradeStatus` field.
 
-**API-level blocking:** Upgrade requests are rejected if `state ∈ {DELETING, DELETE_FAILED, FAILED}`, or if `conditions[CanUpgrade].status != True`. The `CanUpgrade` condition captures whether all user-initiated operations (provisioning and any prior upgrade) have been confirmed complete by HyperShift. `PROGRESSING + CanUpgrade=True` allows upgrades — the HC is at the requested version even though AAP post-provisioning tasks are still running.
+**API-level blocking:** Upgrade requests are rejected if `state ∈ {DELETING, DELETE_FAILED, FAILED}`, or if the DB's `conditions[CanUpgrade].status != True`. Fulfillment sets this per-cluster lock to `False` in the Cluster creation or upgrade-acceptance transaction and to `True` in the corresponding feedback transaction. `PROGRESSING + CanUpgrade=True` allows upgrades — the Cluster `READY` condition can be True while AAP post-provisioning tasks are still running.
 
 **Cluster-internal health states are not an API gate.** HC degraded, CP temporarily unreachable, or NP unhealthy do not affect `CanUpgrade`. If an upgrade is submitted while these conditions are true, the API accepts it and the operator patches HC/NP. Whether the upgrade succeeds depends on HyperShift.
 
@@ -356,6 +353,9 @@ string observed_version = 6;  // output_only; from NodePool.status.version after
 string observed_cp_version = 12;                   // output_only; from HC.status.controlPlaneVersion
 ClusterUpgradeStatus upgrade = 13;                 // output_only; active or most recent upgrade
 repeated ClusterVersionHistoryEntry version_history = 14;  // output_only
+
+// ClusterConditionType addition (the fulfillment DB owns this lock):
+CLUSTER_CONDITION_TYPE_CAN_UPGRADE = 5;
 
 // New messages:
 message ClusterUpgradeStatus {
@@ -378,7 +378,7 @@ message ClusterVersionHistoryEntry {
 
 enum ClusterUpgradeProgressState {
     CLUSTER_UPGRADE_PROGRESS_STATE_UNSPECIFIED = 0;
-    CLUSTER_UPGRADE_PROGRESS_STATE_PENDING = 1;      // accepted; waiting for HC/NP readiness
+    CLUSTER_UPGRADE_PROGRESS_STATE_PENDING = 1;      // accepted; waiting for HyperShift progress
     CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING = 2;
     CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED = 3;
     CLUSTER_UPGRADE_PROGRESS_STATE_FAILED = 4;
@@ -386,16 +386,6 @@ enum ClusterUpgradeProgressState {
 ```
 
 After proto changes, run `make -C proto generate` and commit generated code under `proto/gen/`.
-
-#### ClusterOrder condition additions (`osac-operator/api/v1alpha1/clusterorder_types.go`)
-
-```go
-// ClusterOrderConditionCanUpgrade indicates the HostedCluster and all NodePools
-// are at the OSAC-requested version and ready for a new upgrade to be initiated.
-// Maintained continuously by the operator; checked by the fulfillment-service before
-// accepting upgrade requests.
-ClusterOrderConditionCanUpgrade ClusterOrderConditionType = "CanUpgrade"
-```
 
 #### NodeRequest additions (`osac-operator/api/v1alpha1/clusterorder_types.go`)
 
@@ -467,7 +457,9 @@ where data->'spec'->'version'->'name' is not null
        or data->'status'->>'observed_cp_version' = '');
 ```
 
-No new tables; changes are to the JSONB `data` column.
+No new tables; changes are to the JSONB `data` column. Fulfillment creates new Clusters with DB-owned `CAN_UPGRADE=False` in the same transaction. For existing Clusters, the numbered migration uses one atomic SQL `UPDATE` to set exactly one `CAN_UPGRADE` condition: `True` when persisted `status.conditions[READY].status=True`, `False` otherwise, preserving other conditions. `READY` reflects `ClusterOrder`'s `ClusterAvailable` condition and can be `True` while its phase is `Progressing`.
+
+Current design phase will accept **the following caveat**: The condition does not prove every NodePool is ready or that requested versions have converged, so the migration can unlock a Cluster whose workers are still converging.
 
 ### Implementation Details
 
@@ -477,9 +469,9 @@ Resolve and validate the target `ClusterVersion` before taking the Cluster row l
 
 `validateUpgradeEligibility` (new, called after the row lock):
 1. Reject with `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
-2. Reject with `FAILED_PRECONDITION` if `conditions[CAN_UPGRADE].status != True` — a user-initiated operation (initial provisioning or a prior upgrade) is in progress and HyperShift has not yet confirmed it complete. The error message includes the blocking reason from the condition (e.g. `"HostedCluster not yet Available"`, `"control plane version not yet converged"`).
+2. Reject with `FAILED_PRECONDITION` if `conditions[CAN_UPGRADE].status != True` — initial cluster readiness feedback or a prior upgrade's completion is pending. The error message includes the blocking reason from the condition (e.g. `"cluster is not ready yet"`, `"control plane upgrade in progress"`).
 
-`PROGRESSING + CanUpgrade=True` passes both checks — AAP post-provisioning tasks are running but the HC is at the requested version, so a new upgrade can be accepted. `CanUpgrade` captures operation-completion state, not cluster health.
+`PROGRESSING + CanUpgrade=True` passes both checks — AAP post-provisioning tasks are running but the Cluster `READY` condition was reported, so a new upgrade can be accepted. `CanUpgrade` captures operation-completion state, not cluster health.
 
 `validateVersionUpdate` (`fulfillment-service/internal/servers/private_clusters_server.go`):
 
@@ -494,36 +486,15 @@ Resolve and validate the target `ClusterVersion` before taking the Cluster row l
 3. Target semver ≤ `status.observed_cp_version`. NP version must not exceed CP version (including patch).
 4. `CP_minor - target_NP_minor ≤ 3`. N-3 minor version skew constraint.
 
-After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, pre-resolved `ReleaseImage`, and `CanUpgrade=False` in one transaction. The operator Signal carries `upgradeStatus` state transitions (Pending, Progressing, Succeeded/Failed) and restores `CanUpgrade=True` on completion.
+After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, pre-resolved `ReleaseImage`, `status.upgrade=Pending`, and `CanUpgrade=False` in one transaction. Private status feedback updates `status.upgrade`; fulfillment restores `CanUpgrade=True` in the transaction that records completion.
 
 For version updates, move the `validateClusterStateForSpecUpdate` state check after the catalog lookup and into the locked update path. Other spec updates keep its current behavior.
 
-#### Operator upgrade readiness check
+#### Upgrade lock ownership
 
-The operator maintains the `CanUpgrade` condition on `ClusterOrder` on every reconcile, independently of any active upgrade and independently of the ClusterOrder phase. It answers one question: **has every user-initiated operation (provisioning or upgrade) been confirmed complete by HyperShift?** Cluster-internal health states (HC degraded, CP temporarily unreachable, NP unhealthy) are deliberately excluded — they are not the result of a user operation and must not block new upgrade requests.
+Fulfillment initializes `CanUpgrade=False` in the same transaction that creates the Cluster. For initial provisioning, the feedback controller sends the existing `ClusterAvailable` observation as `Cluster.status.conditions[READY]` through private Cluster Update. Fulfillment locks the Cluster row and stores `READY=True` with `CanUpgrade=True` in one transaction only while `status.upgrade` is unset. Later HC/NP health changes do not change the lock.
 
-**`CanUpgrade = True` when all of the following hold:**
-
-HostedCluster — availability (provisioning confirmed):
-- `conditions[Available].status == True` — the HC exists and is accessible; initial provisioning is complete.
-- `conditions[ControlPlaneAvailable].status == True`
-
-HostedCluster — version convergence (no upgrade in flight):
-- `status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage` AND `history[0].state == "Completed"` — HyperShift confirms the CP is running the version OSAC requested. Guards against the propagation lag after the operator patches `HC.spec.release.image`.
-
-Every existing NodePool — upgrade-in-progress flags:
-- `conditions[UpdatingVersion].status == False` (or condition absent) — no NP version update in progress.
-- `conditions[UpdatingConfig].status == False` (or condition absent) — no NP config change in progress.
-
-Every existing NodePool - readiness
-- `conditions[Ready].status == True` - the NP is ready.
-
-Every existing NodePool — version convergence:
-- `NodePool.status.version == ClusterOrder.spec.nodeRequests[i].Version` — HyperShift confirms the NP is at the version OSAC requested. Guards against the same propagation lag for NP patches.
-
-**Not included** - cluster-internal health states that are not the result of a user-initiated operation, and therfore cannot reliably be detected when a user request is submitted. These affect upgrade success but not upgrade eligibility.
-
-**`CanUpgrade = False`** otherwise, with `reason` and `message` identifying the first unmet condition (e.g. `reason: HostedClusterNotAvailable`, `reason: ControlPlaneVersionNotConverged`, `message: "requested version must be higher than 4.17.21"`).
+For an upgrade, the API stores the target and takes the DB lock in one acceptance transaction. The operator patches HC/NP while `CanUpgrade=False` and reports progress through private status feedback. The private Cluster Update handler releases the DB lock in the transaction that records completion for the current component and target version.
 
 #### buildSpec change in fulfillment-service reconciler
 
@@ -539,20 +510,18 @@ In `clusterorder_controller.go`, the reconcile loop gains upgrade awareness:
 **CP upgrade path:**
 1. Compare `ClusterOrder.spec.ReleaseImage` with `HostedCluster.spec.release.image`. If HC exists and images differ → CP upgrade path.
 2. Set `upgradeStatus = {state: Pending, component: "control_plane", fromVersion: observedVersion, toVersion: spec.version.name}`.
-3. Evaluate upgrade readiness (see [Operator upgrade readiness check](#operator-upgrade-readiness-check)). If not ready: update `upgradeStatus.message` with blocking reason, requeue.
-4. Once ready: patch `HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`; state remains `Pending`.
-5. Monitor: when `HC.status.controlPlaneVersion.desired.version == target_version` → set `upgradeStatus.state = Progressing`, `startTime = now`.
-6. Monitor completion: `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage` AND `history[0].state == "Completed"`.
-7. On completion: set `status.observedVersion` from `HC.status.controlPlaneVersion.history[0].version`; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`; set `conditions[CanUpgrade] = True`. ClusterOrder phase is not changed.
+3. Patch `HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`; state remains `Pending`.
+4. Monitor: when `HC.status.controlPlaneVersion.desired.version == target_version` → set `upgradeStatus.state = Progressing`, `startTime = now`.
+5. Monitor completion: `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage` AND `history[0].state == "Completed"`.
+6. On completion: set `status.observedVersion` from `HC.status.controlPlaneVersion.history[0].version`; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
 **NP upgrade path:**
 1. Compare `ClusterOrder.spec.nodeRequests[i].ReleaseImage` with `NodePool[i].spec.release.image`. If NP exists and images differ → NP upgrade path for that pool.
 2. Set `upgradeStatus = {state: Pending, component: "node_pool:<id>", fromVersion: observed, toVersion: target}`.
-3. Evaluate upgrade readiness. If not ready: update `upgradeStatus.message`, requeue.
-4. Once ready: patch `NodePool[i].spec.release.image = nodeRequests[i].ReleaseImage`; state remains `Pending`.
-5. Monitor: when `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
-6. Monitor completion: `NodePool[i].status.conditions[UpdatingVersion].status == False` AND `NodePool[i].status.version == ClusterOrder.spec.nodeRequests[i].Version`.
-7. On completion: set `node_sets[i].observed_version` in the feedback payload; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`; set `conditions[CanUpgrade] = True`. ClusterOrder phase is not changed.
+3. Patch `NodePool[i].spec.release.image = nodeRequests[i].ReleaseImage`; state remains `Pending`.
+4. Monitor: when `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
+5. Monitor completion: `NodePool[i].status.conditions[UpdatingVersion].status == False` AND `NodePool[i].status.version == ClusterOrder.spec.nodeRequests[i].Version`.
+6. On completion: set `node_sets[i].observed_version` in the feedback payload; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
 **Provision path** (unchanged): if HC does not yet exist or no image divergence on HC or any NP, the existing `DesiredConfigVersion` hash comparison drives AAP provisioning.
 
@@ -568,12 +537,10 @@ NodePools are discovered by listing within the cluster's namespace by `osac.open
 
 | Purpose | Field | Notes |
 |---------|-------|-------|
-| HC upgrade eligibility | `HC.status.conditions[Available].status == True` | Provisioning confirmed; must be True |
-| HC version convergence | `HC.status.controlPlaneVersion.history[0].image` | Must equal `ClusterOrder.spec.ReleaseImage` |
-| HC version convergence | `HC.status.controlPlaneVersion.history[0].state` | Must equal `"Completed"` |
-| NP upgrade-in-progress | `NodePool.status.conditions[UpdatingVersion].status == False` | All NPs; must be False (or absent) |
-| NP upgrade-in-progress | `NodePool.status.conditions[UpdatingConfig].status == False` | All NPs; must be False (or absent) |
-| NP version convergence | `NodePool.status.version` | All NPs; must equal `ClusterOrder.spec.nodeRequests[i].Version` |
+| Initial provisioning confirmation | `Cluster.status.conditions[READY].status == True` | Mapped from `ClusterOrder.conditions[ClusterAvailable]`; releases the DB lock even while phase is Progressing |
+| HC version completion | `HC.status.controlPlaneVersion.history[0].image` | Must equal `ClusterOrder.spec.ReleaseImage` |
+| HC version completion | `HC.status.controlPlaneVersion.history[0].state` | Must equal `"Completed"` |
+| NP upgrade completion | `NodePool.status.version` | The upgraded NP must match its requested version |
 | CP current version | `HC.status.controlPlaneVersion.history` (first `Completed` entry) | Semver string |
 | CP upgrade in progress | `controlPlaneVersion.history[0].state == Partial` | No `completionTime` |
 | CP target during upgrade | `controlPlaneVersion.desired.version` | Display as "upgrading to X" |
@@ -606,7 +573,6 @@ At Phase 1, it is the **tenant's responsibility** to verify that a target versio
 
 | Failure mode | What happens | Recovery | User observes |
 |---|---|---|---|
-| HC/NP conditions not met when operator processes accepted upgrade (HC degraded, not available, version not converged, etc.) | Operator sets `upgradeStatus.state = Pending` with the blocking condition in `message`; requeues without patching HC/NP. The API already accepted the request. | Conditions clear automatically; operator advances to patching on next reconcile. | `status.upgrade.state = Pending` with message indicating why execution is delayed. |
 | Patch HC or NP fails (API error) | Operator retries on next reconcile with backoff. `upgradeStatus.state` remains `Pending`. | Resolve underlying issue; operator resumes automatically. | Upgrade appears stuck in Pending. |
 | Persistent patch failure | After repeated backoff, operator sets `upgradeStatus.state = Failed`. | Operator logs error; new upgrade request required. | `status.upgrade.state = Failed` with message. |
 | Operator crashes mid-upgrade | On restart, operator re-reads `ClusterOrder.spec.ReleaseImage` and `nodeRequests[*].ReleaseImage` and resumes. Patch calls are idempotent. | Automatic on restart. | Brief gap in status updates. |
@@ -620,7 +586,7 @@ At Phase 1, it is the **tenant's responsibility** to verify that a target versio
 
 - No changes to the fulfillment-service tenant RBAC model.
 - osac-operator service account RBAC expanded: `patch` and `update` verbs on `hostedclusters` and `nodepools`.
-- Feedback controller's `Signal` RPC is unchanged; new status fields are added to the existing signal payload.
+- Feedback uses the existing private Cluster Update path for upgrade status; `Signal` remains unchanged and carries only the cluster ID.
 - No changes to OPA policies; upgrade operations are gated by the existing `Update` verb on `Cluster`.
 
 ### Observability and Monitoring
@@ -652,17 +618,20 @@ NP-only upgrades (worker nodes catching up to an already-running CP version) lik
 The test strategy follows the touched-area map for `fulfillment-service` and `osac-operator`.
 
 **Unit tests:**
-- `validateVersionUpdate` — CP upgrade: target > current, not OBSOLETE, N-3 skew against existing NPs, READY state.
-- `validateNPVersionUpdate` — NP upgrade: target ≤ CP, N-3 skew, target > NP current, READY state.
+- `validateVersionUpdate` — CP upgrade: target > current, not OBSOLETE, N-3 skew against existing NPs, and state/lock eligibility.
+- `validateNPVersionUpdate` — NP upgrade: target ≤ CP, N-3 skew, target > NP current, and state/lock eligibility.
 - `buildSpec` — CP and per-NP image resolution from ClusterVersion catalog.
 - Operator upgrade path: image divergence detection, upgrade vs. provision routing.
+- DB-owned lock: Cluster creation and upgrade acceptance each store `CanUpgrade=False` with the operation; HyperShift cluster readiness or upgrade-completion feedback stores `True` with status in one transaction. Migration seeds existing rows from `READY=True`, including `PROGRESSING` clusters; other rows get `False`.
 - `DesiredConfigVersion` hash exclusion: version-only change does not trigger AAP.
 
 **Integration tests:**
 - CP upgrade end-to-end: PATCH spec.version → CanUpgrade=False (sync DB write) → ClusterOrder sync → operator patches HC → completion detected → CanUpgrade=True + history entry.
+- Initial creation: Cluster and `CanUpgrade=False` are stored together; `READY=True` feedback stores `CanUpgrade=True` while ClusterOrder may still be `Progressing`.
 - NP upgrade end-to-end: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → NP patched → NP completion → CanUpgrade=True + per-NP observed_version.
 - Blocking guard: reject upgrade request on DELETING, DELETE_FAILED, FAILED clusters; reject when CanUpgrade=False.
 - Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version and ReleaseImage match the winner and CanUpgrade=False.
+- Stale completion feedback for an earlier target cannot release the lock for a later upgrade.
 - N-3 skew rejection: NP upgrade rejected when skew would exceed 3 minor versions; CP upgrade rejected when it would leave any NP more than 3 minor versions behind.
 - NP version ≤ CP version enforcement: NP upgrade to version > CP rejected.
 

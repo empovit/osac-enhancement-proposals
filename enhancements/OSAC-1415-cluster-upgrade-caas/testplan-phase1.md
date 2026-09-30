@@ -31,19 +31,20 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 1. `PATCH /clusters/{id}` with `spec.version = "4.17.3"`.
 2. `GET /clusters/{id}` immediately after.
-3. Simulate operator setting `upgradeStatus.state = Progressing` and signaling to fulfillment-service.
-4. Simulate operator completing upgrade: sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, signals CLUSTER_STATE_READY.
+3. Simulate operator setting `upgradeStatus.state = Progressing` and sending private status feedback.
+4. Simulate operator completing upgrade: sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, and sends private status feedback.
 5. `GET /clusters/{id}`.
 
 ##### Expected Results
 
 - After step 1: HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`.
-- After step 2: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
+- After step 2: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PENDING` and `conditions[CAN_UPGRADE].status = False`.
+- After step 3: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
 - After step 5: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`.
 
 ---
 
-#### TC-FR7-01b: CP upgrade completion requires version match in HC history
+#### TC-FR7-01b: CP upgrade completion requires target image in HC history
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -55,14 +56,14 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Steps
 
-1. Simulate `HC.status.controlPlaneVersion.history[0].state = "Completed"` but `history[0].version = "4.17.2"` (version mismatch — different version completed).
+1. Simulate `HC.status.controlPlaneVersion.history[0].state = "Completed"` but `history[0].image` still names the previous release image.
 2. `GET /clusters/{id}`.
-3. Simulate `HC.status.controlPlaneVersion.history[0].version = "4.17.3"` (correct version) AND `history[0].state = "Completed"` AND all eligibility conditions hold.
+3. Simulate `HC.status.controlPlaneVersion.history[0].image = ClusterOrder.spec.ReleaseImage`, `version = "4.17.3"`, and `state = "Completed"`.
 4. `GET /clusters/{id}`.
 
 ##### Expected Results
 
-- After step 2: `conditions[CAN_UPGRADE].status = False` — completion not declared while `history[0].version != "4.17.3"`.
+- After step 2: `conditions[CAN_UPGRADE].status = False` — completion is not declared while the completed history image differs from the requested target.
 - After step 4: `conditions[CAN_UPGRADE].status = True`, `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `status.observed_cp_version = "4.17.3"`.
 
 ---
@@ -110,7 +111,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ---
 
-#### TC-FR7-03b: NP upgrade completion requires NodePool.status.version match and eligibility conditions
+#### TC-FR7-03b: NP upgrade completion requires NodePool.status.version match
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -124,7 +125,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 1. Simulate `NodePool["workers"].status.conditions[UpdatingVersion].status = False` but `NodePool["workers"].status.version = "4.17.2"` (version mismatch).
 2. `GET /clusters/{id}`.
-3. Simulate `NodePool["workers"].status.version = "4.17.3"` AND all eligibility conditions hold.
+3. Simulate `NodePool["workers"].status.version = "4.17.3"` with `UpdatingVersion=False`.
 4. `GET /clusters/{id}`.
 
 ##### Expected Results
@@ -303,7 +304,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_READY` with `CAN_UPGRADE=True` and `observed_cp_version = "4.16.5"`. ClusterVersions `4.17.3` and `4.17.4` are ACTIVE. Do not deliver an operator Signal during the test.
+- Cluster in `CLUSTER_STATE_READY` with `CAN_UPGRADE=True` and `observed_cp_version = "4.16.5"`. ClusterVersions `4.17.3` and `4.17.4` are ACTIVE. Do not deliver upgrade completion feedback during the test.
 
 ##### Steps
 
@@ -405,7 +406,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning in progress). HC `Available=False` (HostedCluster not yet ready). `CAN_UPGRADE=False`, `reason=HostedClusterNotAvailable`. ClusterVersion `4.17.3` ACTIVE.
+- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning in progress). HC `Available=False` and Cluster `READY=False`. Fulfillment created the Cluster with `CAN_UPGRADE=False`. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 
@@ -413,7 +414,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- gRPC `FAILED_PRECONDITION`, message includes `"HostedCluster not yet Available"` (from the `CanUpgrade` condition reason). No `ClusterOrder.spec.ReleaseImage` change. Blocking rule: `CAN_UPGRADE=False`.
+- gRPC `FAILED_PRECONDITION`, message identifies missing Cluster `READY=True` feedback. No `ClusterOrder.spec.ReleaseImage` change. Blocking rule: DB `CAN_UPGRADE=False`.
 
 ---
 
@@ -425,15 +426,17 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_PROGRESSING` (AAP post-provisioning tasks still running). `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
+- A new Cluster was stored with `CAN_UPGRADE=False` in its creation transaction. `CLUSTER_STATE_PROGRESSING` persists while AAP post-provisioning tasks run. `ClusterOrder.conditions[ClusterAvailable]=True`, but Cluster `READY=True` feedback has not yet been stored. `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 
-1. `PATCH /clusters/{id}` `spec.version = "4.17.3"`.
+1. Deliver Cluster `READY=True` through private status feedback while `ClusterOrder.phase=Progressing`.
+2. `PATCH /clusters/{id}` `spec.version = "4.17.3"`.
 
 ##### Expected Results
 
-- HTTP 200, cluster state unchanged (PROGRESSING), `conditions[CAN_UPGRADE].status = False`. OSAC state `PROGRESSING` is not a blocked state; upgrades are accepted when `CanUpgrade=True`.
+- Step 1 stores `READY=True` and `CAN_UPGRADE=True` in one transaction while Cluster state remains `PROGRESSING`.
+- Step 2 returns HTTP 200 and stores the upgrade target with `CAN_UPGRADE=False` in one transaction.
 
 ---
 
@@ -445,7 +448,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_PROGRESSING`. HC was successfully provisioned; AAP post-provisioning tasks subsequently failed. `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
+- Cluster in `CLUSTER_STATE_PROGRESSING` with `READY=True` and DB `CAN_UPGRADE=True`; AAP post-provisioning tasks subsequently failed. `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 
@@ -457,7 +460,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ---
 
-#### TC-IC1-08: Upgrade rejected when PROGRESSING + CP version not yet converged (CanUpgrade=False)
+#### TC-IC1-08: Upgrade rejected when HC Available but Cluster READY=False
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -465,7 +468,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning; HC created and Available=True). `HC.status.controlPlaneVersion.history[0].image != ClusterOrder.spec.ReleaseImage` — version not yet confirmed by HyperShift history. `CAN_UPGRADE=False`, `reason=ControlPlaneVersionNotConverged`. ClusterVersion `4.17.3` ACTIVE.
+- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning; HC created and Available=True) with Cluster `READY=False` and DB `CAN_UPGRADE=False`. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 
@@ -473,7 +476,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- gRPC `FAILED_PRECONDITION`, message includes the version mismatch (e.g. `"control plane version not yet converged"`). No `ClusterOrder.spec.ReleaseImage` change. Blocking rule: `CAN_UPGRADE=False`.
+- gRPC `FAILED_PRECONDITION`, message identifies missing Cluster `READY=True` feedback. No `ClusterOrder.spec.ReleaseImage` change. Blocking rule: DB `CAN_UPGRADE=False`.
 
 ---
 
@@ -499,7 +502,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ---
 
-#### TC-IC2-05: NP upgrade rejected when PROGRESSING + NP version not yet converged (CanUpgrade=False)
+#### TC-IC2-05: NP upgrade rejected before Cluster READY feedback (CanUpgrade=False)
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -507,7 +510,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning). Node pool `workers`: `UpdatingVersion=False`, but `NodePool.status.version ("4.16.4") != ClusterOrder.spec.nodeRequests["workers"].Version ("4.16.5")` — NP version not yet confirmed by HyperShift. `CAN_UPGRADE=False`, `reason=NodePoolVersionNotConverged`. ClusterVersion `4.17.0` ACTIVE.
+- Cluster in `CLUSTER_STATE_PROGRESSING` (initial provisioning) with Cluster `READY=False` and DB `CAN_UPGRADE=False`. Node pool `workers` has not reached its requested version. ClusterVersion `4.17.0` ACTIVE.
 
 ##### Steps
 
@@ -515,7 +518,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- gRPC `FAILED_PRECONDITION`, message includes the NP version mismatch. No `ClusterOrder.spec.nodeRequests` change. Blocking rule: `CAN_UPGRADE=False`.
+- gRPC `FAILED_PRECONDITION`, message identifies missing Cluster `READY=True` feedback. No `ClusterOrder.spec.nodeRequests` change. Blocking rule: DB `CAN_UPGRADE=False`.
 
 ---
 

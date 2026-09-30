@@ -3,7 +3,7 @@ title: cluster-upgrade-caas
 authors:
   - vemporop@redhat.com
 creation-date: 2026-09-22
-last-updated: 2026-09-29
+last-updated: 2026-10-04
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-1415
 prd:
@@ -65,7 +65,7 @@ timeline
 
 ### Phase 1 — Independent upgrades
 
-Control plane and node pools are upgraded independently and sequentially. The operator patches `spec.release.image` on the target `HostedCluster` or `NodePool` directly, bypassing AAP. A `CanUpgrade` condition gates serial access and reflects operation completion as confirmed by HyperShift. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
+Control plane and node pools are upgraded independently and sequentially. The operator patches `spec.release.image` on the target `HostedCluster` or `NodePool` directly, bypassing AAP. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
 
 Upgrades are triggered through `osac edit cluster`, a new `osac upgrade cluster` command, or directly via `PATCH /clusters/{id}`.
 
