@@ -295,7 +295,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ---
 
-#### TC-IC1-01b: Concurrent upgrade request rejected immediately after first upgrade accepted
+#### TC-IC1-01b: Only one concurrent upgrade request succeeds
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -303,17 +303,17 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_READY`. `observed_cp_version = "4.16.5"`. ClusterVersions `4.17.3` and `4.17.4` ACTIVE. Operator Signal has not yet been received (upgrade not yet propagated to ClusterOrder).
+- Cluster in `CLUSTER_STATE_READY` with `CAN_UPGRADE=True` and `observed_cp_version = "4.16.5"`. ClusterVersions `4.17.3` and `4.17.4` are ACTIVE. Do not deliver an operator Signal during the test.
 
 ##### Steps
 
-1. `PATCH /clusters/{id}` `spec.version = "4.17.3"` — accepted; `conditions[CAN_UPGRADE] = False` written in the same DB transaction.
-2. Without waiting for the operator Signal, `PATCH /clusters/{id}` `spec.version = "4.17.4"`.
+1. Use a barrier to start two `PATCH /clusters/{id}` requests at the same time, for `spec.version = "4.17.3"` and `spec.version = "4.17.4"`.
+2. Read the stored Cluster and resolved ReleaseImage after both requests finish.
 
 ##### Expected Results
 
-- Step 1: HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False` in the response.
-- Step 2: gRPC `FAILED_PRECONDITION`, message includes upgrade-in-progress reason from `CanUpgrade` condition. No `ClusterOrder.spec.ReleaseImage` change beyond what step 1 applied. The condition write in step 1 is synchronous — no race window exists between accepting the request and rejecting the concurrent one.
+- One request returns HTTP 200; the other returns `FAILED_PRECONDITION` with the `CanUpgrade` reason.
+- The stored version and ReleaseImage match the successful request, and `CanUpgrade=False`. The rejected request changes nothing.
 
 ---
 

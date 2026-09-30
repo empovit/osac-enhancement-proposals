@@ -3,7 +3,7 @@ title: cluster-upgrade-caas-phase1
 authors:
   - vemporop@redhat.com
 creation-date: 2026-09-22
-last-updated: 2026-09-22
+last-updated: 2026-09-30
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-1415
 prd:
@@ -170,9 +170,9 @@ The CLI has no kubeconfig and never calls the Kubernetes API.
 
 **Source file:** `fulfillment-service/internal/servers/clusters_server.go`
 
-The `ClustersServer.Update` handler runs two validations sequentially before writing to the database.
+Resolve and validate the target `ClusterVersion` before locking the Cluster row. Then use the generic update path to lock the row (`SELECT ... FOR UPDATE`), apply the update mask, and check upgrade eligibility, observed versions, and skew against the locked Cluster.
 
-**`validateUpgradeEligibility`** (new, called first):
+**`validateUpgradeEligibility`** (new, called after locking the Cluster):
 1. Reject `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
 2. Reject `FAILED_PRECONDITION` if `conditions[CAN_UPGRADE].status != True`. The error message includes the blocking reason from the condition.
 
@@ -180,7 +180,7 @@ The `ClustersServer.Update` handler runs two validations sequentially before wri
 
 **`validateVersionUpdate` (CP) / `validateNPVersionUpdate` (NP)**:
 
-Looks up the target `ClusterVersion` from the OSAC catalog. This lookup serves both as validation and as the source of the resolved release image (`ClusterVersion.spec.image`):
+Before taking the Cluster row lock, look up the target `ClusterVersion` in the OSAC catalog. Validate it and capture its release image (`ClusterVersion.spec.image`). The checks against the Cluster's observed versions run after the lock is acquired:
 
 | Check | CP | NP |
 |---|---|---|
@@ -189,12 +189,11 @@ Looks up the target `ClusterVersion` from the OSAC catalog. This lookup serves b
 | no downgrade | ✓ | ✓ |
 | version skew | CP target leaves no NP > 3 minor versions behind | target NP ≤ CP version; `CP_minor − NP_minor ≤ 3` |
 
-**Database write** (single transaction):
-- Persist `spec.version` (CP) or `spec.node_sets[i].version` (NP)
-- Persist `ReleaseImage` resolved from `ClusterVersion.spec.image`
-- Set `conditions[CAN_UPGRADE] = False`
+**Database write** (one transaction):
+- With the row locked, recheck `CanUpgrade=True`; otherwise return `FAILED_PRECONDITION`.
+- Save the requested CP or NP version, resolved `ReleaseImage`, and `CanUpgrade=False` together.
 
-Returns HTTP 200. Concurrent upgrade requests are rejected at eligibility check 2, closing the TOCTOU window between API return and operator signal.
+Hold the lock through commit. A concurrent request then sees `CanUpgrade=False` and is rejected.
 
 #### Step 3 — Cluster Reconciler → ClusterOrder Patch
 
@@ -471,7 +470,9 @@ No new tables; changes are to the JSONB `data` column.
 
 #### Version validation in fulfillment-service
 
-`validateUpgradeEligibility` (new, called before `validateVersionUpdate`):
+Resolve and validate the target `ClusterVersion` before taking the Cluster row lock. Use a non-locking read of the stored Cluster to check the version reference's scope, including shared versions; the later locked read is authoritative for upgrade state and skew. Like cluster provisioning, the catalog read uses the request transaction but does not lock the `ClusterVersion`. Check `enabled` and `state` when reading it, then use its immutable `version` and `image` for the accepted request.
+
+`validateUpgradeEligibility` (new, called after the row lock):
 1. Reject with `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
 2. Reject with `FAILED_PRECONDITION` if `conditions[CAN_UPGRADE].status != True` — a user-initiated operation (initial provisioning or a prior upgrade) is in progress and HyperShift has not yet confirmed it complete. The error message includes the blocking reason from the condition (e.g. `"HostedCluster not yet Available"`, `"control plane version not yet converged"`).
 
@@ -490,9 +491,9 @@ No new tables; changes are to the JSONB `data` column.
 3. Target semver ≤ `status.observed_cp_version`. NP version must not exceed CP version (including patch).
 4. `CP_minor - target_NP_minor ≤ 3`. N-3 minor version skew constraint.
 
-Only after both `validateUpgradeEligibility` and `validateVersionUpdate` pass does the fulfillment-service write to the database. The DB write persists `spec.version` (or `spec.node_sets[i].version`) and the resolved `ReleaseImage` **and** sets `conditions[CAN_UPGRADE] = False` in the same transaction, before returning HTTP 200. This atomically blocks concurrent upgrade requests at eligibility step 2, closing the window between API return and operator signal. The operator Signal carries `upgradeStatus` state transitions (Pending, Progressing, Succeeded/Failed) and restores `CanUpgrade=True` on completion.
+After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, pre-resolved `ReleaseImage`, and `CanUpgrade=False` in one transaction. The operator Signal carries `upgradeStatus` state transitions (Pending, Progressing, Succeeded/Failed) and restores `CanUpgrade=True` on completion.
 
-`validateClusterStateForSpecUpdate` is unchanged — it blocks scaling and non-version spec changes based on ClusterOrder state.
+For version updates, move the `validateClusterStateForSpecUpdate` state check after the catalog lookup and into the locked update path. Other spec updates keep its current behavior.
 
 #### Operator upgrade readiness check
 
@@ -658,6 +659,7 @@ The test strategy follows the touched-area map for `fulfillment-service` and `os
 - CP upgrade end-to-end: PATCH spec.version → CanUpgrade=False (sync DB write) → ClusterOrder sync → operator patches HC → completion detected → CanUpgrade=True + history entry.
 - NP upgrade end-to-end: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → NP patched → NP completion → CanUpgrade=True + per-NP observed_version.
 - Blocking guard: reject upgrade request on DELETING, DELETE_FAILED, FAILED clusters; reject when CanUpgrade=False.
+- Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version and ReleaseImage match the winner and CanUpgrade=False.
 - N-3 skew rejection: NP upgrade rejected when skew would exceed 3 minor versions; CP upgrade rejected when it would leave any NP more than 3 minor versions behind.
 - NP version ≤ CP version enforcement: NP upgrade to version > CP rejected.
 
