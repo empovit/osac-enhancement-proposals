@@ -76,7 +76,7 @@ User
  │
  ▼
 CLI (upgrade_cmd.go / edit_cmd.go)
- │  gRPC: ClustersUpdateRequest spec.version=4.17.3
+ │  gRPC: ClustersUpdateRequest spec.version={name: "4-17-3"}
  │  update_mask: ["spec.version"]
  ▼
 Fulfillment-Service API (clusters_server.go)
@@ -152,8 +152,8 @@ The CLI performs the following steps:
 
 1. Looks up the cluster by name or ID.
 2. Validates that `--version` is provided and exactly one of `--control-plane` or `--node-set` is specified.
-3. Clones and mutates the cluster proto:
-   - CP: `updated.GetSpec().SetVersion(newVersion)`
+3. Resolves `--version` as `osac create cluster` does: match `ClusterVersion.metadata.name` or `ClusterVersion.spec.version`, preferring the name if both match different versions. Then clone and mutate the cluster proto (using the selected version's metadata name for CP and semantic version for NP):
+   - CP: `updated.GetSpec().SetVersion(publicv1.ClusterVersionReference_builder{Name: versionName}.Build())`
    - NP: `updated.GetSpec().GetNodeSets()[nodeSetName].SetVersion(newVersion)`
 4. Sends update with a field mask:
    ```go
@@ -345,9 +345,12 @@ stateDiagram-v2
 #### Proto additions (`proto/private/osac/private/v1/cluster_type.proto`)
 
 ```protobuf
+// Existing ClusterSpec field (used for CP upgrades; no new field required):
+ClusterVersionReference version = 6;
+
 // ClusterNodeSet additions:
-string version = 4;           // desired NP version; settable via PATCH
-string observed_version = 5;  // output_only; from NodePool.status.version after upgrade
+string version = 5;           // desired NP version; settable via PATCH
+string observed_version = 6;  // output_only; from NodePool.status.version after upgrade
 
 // ClusterStatus additions:
 string observed_cp_version = 12;                   // output_only; from HC.status.controlPlaneVersion
