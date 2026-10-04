@@ -244,7 +244,7 @@ HyperShift's controllers perform the actual upgrade. The operator monitors for c
 - `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage`
 - `HC.status.controlPlaneVersion.history[0].state == "Completed"`
 
-**NP:** The NodePool controller re-provisions worker nodes to the target version. Completion criteria:
+**NP:** The NodePool controller upgrades worker nodes to the target version. OSAC currently sets `spec.management.upgradeType: InPlace` on every HyperShift NodePool because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters. Completion criteria:
 - `NodePool[i].status.conditions[UpdatingVersion].status == False`
 - `NodePool[i].status.version == ClusterOrder.spec.nodeRequests[i].Version`
 
@@ -302,7 +302,7 @@ The feedback controller sends the status through the existing private Cluster Up
 ┌─────────────────────────────────────────────────────────────────────┐
 │              HYPERSHIFT CONTROLLER                                  │
 │  CP: CVO upgrades control plane; history[0].state=Completed         │
-│  NP: NodePool controller re-provisions workers; status.version=target│
+│  NP: NodePool controller upgrades workers; status.version=target     │
 └────────────────────────┬────────────────────────────────────────────┘
                          │ controller-runtime watch (ClusterOrder status)
                          ▼
