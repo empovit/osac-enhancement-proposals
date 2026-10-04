@@ -3,8 +3,8 @@
 ## Overview
 
 - **Feature:** OSAC-1415 — Cluster Upgrade CaaS (Stage 1)
-- **Total test cases:** 42
-- **Requirements covered:** 7 of 8 (FR-7, FR-8, FR-10, FR-11, FR-12, FR-13, NFR-1); NFR-2 is documentation
+- **Total test cases:** 44
+- **Requirements with test cases:** 7 of 8 (FR-7, FR-8, FR-10, FR-11, FR-12, FR-13, NFR-1); NFR-2 is documentation
 - **Interface changes covered:** 9 of 9 (IC-1 through IC-9)
 
 ---
@@ -32,15 +32,16 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 1. `PATCH /clusters/{id}` with `spec.version = "4.17.3"`.
 2. `GET /clusters/{id}` immediately after.
 3. Simulate operator setting `upgradeStatus.state = Progressing` and sending private status feedback.
-4. Simulate operator completing upgrade: sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, and sends private status feedback.
-5. `GET /clusters/{id}`.
+4. `GET /clusters/{id}`.
+5. Simulate operator completing upgrade: sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, and sends private status feedback.
+6. `GET /clusters/{id}`.
 
 ##### Expected Results
 
 - After step 1: HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`.
 - After step 2: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PENDING` and `conditions[CAN_UPGRADE].status = False`.
-- After step 3: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
-- After step 5: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`, and Cluster/ClusterOrder provisioning status is unchanged.
+- After step 4: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
+- After step 6: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`, and Cluster/ClusterOrder provisioning status is unchanged.
 
 ---
 
@@ -972,7 +973,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 | Requirement | Gap |
 |-------------|-----|
 | FR-8 (NP version capped at CP version) | Tested by TC-IC2-02 (NP upgrade rejected when target version exceeds CP version). |
-| FR-11 (NP version cap follows CP; no concurrent CP+NP upgrade) | NP version cap: tested by TC-IC2-02. No concurrent CP+NP: tested by TC-FR10-01, TC-FR10-02, TC-FR10-03. |
+| FR-11 (NP version cap follows CP; no concurrent CP+NP upgrade) | NP version cap: tested by TC-IC2-02. TC-FR10-03 rejects an NP request during a CP upgrade; TC-FR10-01 rejects a CP request during an unspecified active upgrade. A CP request during an NP upgrade is not explicitly covered. |
 | FR-12 (unsupported version skews blocked) | Tested by TC-IC2-03 (NP upgrade N-3 skew rejection) and TC-IC1-11 (CP upgrade N-3 skew rejection against existing NPs). |
 | NFR-2 (user documentation) | Documentation requirement; no automated test applicable. Documentation must be produced as a separate deliverable. |
 
@@ -987,11 +988,11 @@ All 9 interface changes are covered by test cases. No gaps.
 | Metric | Count |
 |--------|-------|
 | Total test cases | 44 |
-| Critical | 19 |
-| High | 18 |
-| Medium | 6 |
+| Critical | 20 |
+| High | 14 |
+| Medium | 7 |
 | Low | 3 |
-| Automated | 38 |
+| Automated | 44 |
 | Manual | 0 |
 | Requirements with test cases | 7 / 8 |
 | Interface changes with test cases | 9 / 9 |
