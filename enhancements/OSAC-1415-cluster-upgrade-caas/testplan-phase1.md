@@ -312,12 +312,12 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 ##### Steps
 
 1. Use a barrier to start two `PATCH /clusters/{id}` requests at the same time, for `spec.version = "4.17.3"` and `spec.version = "4.17.4"`.
-2. Read the stored Cluster and resolved ReleaseImage after both requests finish.
+2. Read the stored Cluster after both requests finish; reconcile it and read the derived `ClusterOrder.spec.ReleaseImage`.
 
 ##### Expected Results
 
 - One request returns HTTP 200; the other returns `FAILED_PRECONDITION` with the `CanUpgrade` reason.
-- The stored version and ReleaseImage match the successful request, and `CanUpgrade=False`. The rejected request changes nothing.
+- The stored Cluster version matches the successful request and has no stored release image; `CanUpgrade=False`. The reconciled `ClusterOrder.spec.ReleaseImage` matches that version's `ClusterVersion.spec.image`. The rejected request changes nothing.
 
 ---
 

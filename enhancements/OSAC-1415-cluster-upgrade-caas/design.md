@@ -43,7 +43,7 @@ OSAC provisions HyperShift Hosted Control Plane clusters but currently has no AP
 
 ## Proposal
 
-Cluster upgrades are triggered by **updating a version field on the OSAC `Cluster` resource** — `spec.version` for the control plane, `spec.node_sets[*].version` for a node pool. The fulfillment-service validates the target version and syncs it to the `ClusterOrder` CR. The osac-operator detects image divergence and patches the corresponding HyperShift CRD directly, bypassing AAP. Upgrade progress and history are fed back through the existing Signal RPC.
+Cluster upgrades are triggered by **updating a version field on the OSAC `Cluster` resource** — `spec.version` for the control plane, `spec.node_sets[*].version` for a node pool. The fulfillment-service validates the target version, then resolves its release image from `ClusterVersion` when building the `ClusterOrder` CR; the Cluster stores version selectors, not release images. The osac-operator detects image divergence and patches the corresponding HyperShift CRD directly, bypassing AAP. Upgrade progress and history are fed back through the existing Signal RPC.
 
 ### Phase overview
 

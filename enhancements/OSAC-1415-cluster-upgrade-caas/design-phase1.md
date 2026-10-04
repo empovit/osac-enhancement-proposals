@@ -81,11 +81,11 @@ CLI (upgrade_cmd.go / edit_cmd.go)
  ▼
 Fulfillment-Service API (clusters_server.go)
  │  1. validateUpgradeEligibility: state ∉ {DELETING,DELETE_FAILED,FAILED}, CanUpgrade=True
- │  2. validateVersionUpdate: ClusterVersion catalog lookup → resolves spec.image
- │  3. PostgreSQL: persist spec.version + resolved ReleaseImage + CanUpgrade=False (atomic)
+ │  2. validateVersionUpdate: ClusterVersion catalog lookup → validates target
+ │  3. PostgreSQL: persist spec.version + CanUpgrade=False (atomic)
  ▼
 Cluster Reconciler (cluster_reconciler_function.go)
- │  buildSpec reads pre-resolved ReleaseImage from DB
+ │  buildSpec resolves ClusterVersion.spec.image from spec.version
  │  K8s PATCH: ClusterOrder.spec.ReleaseImage
  ▼
 osac-operator (clusterorder_controller.go)
@@ -115,11 +115,11 @@ CLI (upgrade_cmd.go / edit_cmd.go)
  ▼
 Fulfillment-Service API (clusters_server.go)
  │  1. validateUpgradeEligibility
- │  2. validateNPVersionUpdate: ClusterVersion catalog lookup → resolves spec.image
- │  3. PostgreSQL: persist spec.node_sets[i].version + resolved ReleaseImage + CanUpgrade=False (atomic)
+ │  2. validateNPVersionUpdate: ClusterVersion catalog lookup → validates target
+ │  3. PostgreSQL: persist spec.node_sets[i].version + CanUpgrade=False (atomic)
  ▼
 Cluster Reconciler (cluster_reconciler_function.go)
- │  buildSpec reads pre-resolved ReleaseImage from DB
+ │  buildSpec resolves ClusterVersion.spec.image from node_sets[i].version
  │  K8s PATCH: ClusterOrder.spec.nodeRequests[i].{ReleaseImage,Version}
  ▼
 osac-operator (clusterorder_controller.go)
@@ -180,7 +180,7 @@ Resolve and validate the target `ClusterVersion` before locking the Cluster row.
 
 **`validateVersionUpdate` (CP) / `validateNPVersionUpdate` (NP)**:
 
-Before taking the Cluster row lock, look up the target `ClusterVersion` in the OSAC catalog. Validate it and capture its release image (`ClusterVersion.spec.image`). The checks against the Cluster's observed versions run after the lock is acquired:
+Before taking the Cluster row lock, look up and validate the target `ClusterVersion` in the OSAC catalog. The checks against the Cluster's observed versions run after the lock is acquired:
 
 | Check | CP | NP |
 |---|---|---|
@@ -191,7 +191,7 @@ Before taking the Cluster row lock, look up the target `ClusterVersion` in the O
 
 **Database write** (one transaction):
 - With the row locked, recheck `CanUpgrade=True`; otherwise return `FAILED_PRECONDITION`.
-- Save the requested CP or NP version, resolved `ReleaseImage`, and `CanUpgrade=False` together.
+- Save the requested CP or NP version and `CanUpgrade=False` together.
 
 Hold the lock through commit. A concurrent request then sees `CanUpgrade=False` and is rejected.
 
@@ -199,12 +199,12 @@ Hold the lock through commit. A concurrent request then sees `CanUpgrade=False` 
 
 **Source file:** `fulfillment-service/internal/controllers/cluster/cluster_reconciler_function.go`
 
-The reconciler loop reads the pre-resolved `ReleaseImage` stored in the DB cluster record and patches the `ClusterOrder` CR. No separate catalog lookup is needed:
+As during cluster creation, the reconciler resolves the selected versions from the `ClusterVersion` catalog and patches the `ClusterOrder` CR. The Cluster DB record stores version selectors, not release images:
 
-| DB field | ClusterOrder field |
+| Cluster version selector | ClusterOrder field |
 |---|---|
-| resolved CP `ReleaseImage` | `spec.ReleaseImage` |
-| resolved NP `ReleaseImage` | `spec.nodeRequests[i].ReleaseImage` |
+| `spec.version` → `ClusterVersion.spec.image` | `spec.ReleaseImage` |
+| `spec.node_sets[i].version` → `ClusterVersion.spec.image` | `spec.nodeRequests[i].ReleaseImage` |
 | `spec.node_sets[i].version` | `spec.nodeRequests[i].Version` |
 
 `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
@@ -275,14 +275,14 @@ The feedback controller sends the status through the existing private Cluster Up
 │            FULFILLMENT-SERVICE  (clusters_server.go)                │
 │  1. validateUpgradeEligibility: state, CanUpgrade=True              │
 │  2. validateVersionUpdate / validateNPVersionUpdate:                │
-│       ClusterVersion catalog lookup → ClusterVersion.spec.image     │
-│  3. PostgreSQL: spec.version + ReleaseImage + CanUpgrade=False      │
+│       ClusterVersion catalog lookup → validate target              │
+│  3. PostgreSQL: version selector + CanUpgrade=False                │
 └────────────────────────┬────────────────────────────────────────────┘
                          │ Reconciler loop tick
                          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │      CLUSTER RECONCILER  (cluster_reconciler_function.go)           │
-│  1. Read DB: ReleaseImage (pre-resolved)                            │
+│  1. Resolve version selector → ClusterVersion.spec.image           │
 │  2. PATCH ClusterOrder.spec.ReleaseImage (CP)                       │
 │     or ClusterOrder.spec.nodeRequests[i].{ReleaseImage,Version} (NP)│
 └────────────────────────┬────────────────────────────────────────────┘
@@ -465,7 +465,7 @@ Current design phase will accept **the following caveat**: The condition does no
 
 #### Version validation in fulfillment-service
 
-Resolve and validate the target `ClusterVersion` before taking the Cluster row lock. Use a non-locking read of the stored Cluster to check the version reference's scope, including shared versions; the later locked read is authoritative for upgrade state and skew. Like cluster provisioning, the catalog read uses the request transaction but does not lock the `ClusterVersion`. Check `enabled` and `state` when reading it, then use its immutable `version` and `image` for the accepted request.
+Resolve and validate the target `ClusterVersion` before taking the Cluster row lock. Use a non-locking read of the stored Cluster to check the version reference's scope, including shared versions; the later locked read is authoritative for upgrade state and skew. Like cluster provisioning, the catalog read uses the request transaction but does not lock the `ClusterVersion`. Check `enabled` and `state` when reading it, then use its immutable `version` for validation. The reconciler looks up its immutable `image` when building the `ClusterOrder`.
 
 `validateUpgradeEligibility` (new, called after the row lock):
 1. Reject with `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
@@ -486,7 +486,7 @@ Resolve and validate the target `ClusterVersion` before taking the Cluster row l
 3. Target semver ≤ `status.observed_cp_version`. NP version must not exceed CP version (including patch).
 4. `CP_minor - target_NP_minor ≤ 3`. N-3 minor version skew constraint.
 
-After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, pre-resolved `ReleaseImage`, `status.upgrade=Pending`, and `CanUpgrade=False` in one transaction. Private status feedback updates `status.upgrade`; fulfillment restores `CanUpgrade=True` in the transaction that records `Succeeded` or terminal `Failed`.
+After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, `status.upgrade=Pending`, and `CanUpgrade=False` in one transaction. Private status feedback updates `status.upgrade`; fulfillment restores `CanUpgrade=True` in the transaction that records `Succeeded` or terminal `Failed`.
 
 For version updates, move the `validateClusterStateForSpecUpdate` state check after the catalog lookup and into the locked update path. Other spec updates keep its current behavior.
 
@@ -499,8 +499,8 @@ For an upgrade, the API stores the target and takes the DB lock in one acceptanc
 #### buildSpec change in fulfillment-service reconciler
 
 `buildSpec` in `fulfillment-service/internal/controllers/cluster/cluster_reconciler_function.go`:
-- Reads the pre-resolved `ReleaseImage` from the DB cluster record (stored by the API handler as part of the `validateVersionUpdate` transaction) and sets `ClusterOrder.spec.ReleaseImage` (CP image).
-- Reads the pre-resolved per-NP `ReleaseImage` and `Version` from the DB cluster record and sets `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage` (pullspec) and `ClusterOrder.spec.nodeRequests[<id>].Version` (semver). No separate catalog lookup is needed.
+- Resolves `Cluster.spec.version` to `ClusterVersion.spec.image`, as during creation, and sets `ClusterOrder.spec.ReleaseImage` (CP image).
+- Resolves each specified `Cluster.spec.node_sets[<id>].version` by `ClusterVersion.spec.version` and sets `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage` (pullspec) and `ClusterOrder.spec.nodeRequests[<id>].Version` (semver). No resolved image is stored on `Cluster`.
 - `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
 
 #### osac-operator upgrade reconciliation
@@ -575,6 +575,7 @@ At Phase 1, it is the **tenant's responsibility** to verify that a target versio
 |---|---|---|---|
 | Retryable HC or NP patch error | Operator retries on next reconcile with backoff. `upgradeStatus.state` remains `Pending`. | Resolve underlying issue; operator resumes automatically. | Upgrade remains Pending. |
 | Operator crashes mid-upgrade | On restart, operator re-reads `ClusterOrder.spec.ReleaseImage` and `nodeRequests[*].ReleaseImage` and resumes. Patch calls are idempotent. | Automatic on restart. | Brief gap in status updates. |
+| Catalog lookup fails during reconciliation | `ClusterOrder` is not updated; reconciliation retries and the accepted upgrade remains Pending. | Restore catalog access; node-pool version deletion protection is deferred (Open Question 9.2). | Upgrade remains Pending. |
 | Terminal upgrade failure (criteria TBD) | Upgrade cannot proceed; operator sets `upgradeStatus.state = Failed` without changing ClusterOrder provisioning status. Fulfillment sets `CanUpgrade=True` when it records the result. | Investigate the upgrade failure; recovery details follow the terminal-failure criteria. | `status.upgrade.state = Failed` with message; Cluster state is unchanged. |
 | Target version not found in the ClusterVersion catalog | Rejected at `validateVersionUpdate`. | User specifies a valid version name. | `INVALID_ARGUMENT` with message. |
 | Version downgrade attempted | Rejected at `validateVersionUpdate`. | User selects a valid target. | `INVALID_ARGUMENT` with message. |
@@ -612,6 +613,10 @@ OSAC enforces one operation at a time (no concurrent NP upgrades across differen
 
 NP-only upgrades (worker nodes catching up to an already-running CP version) likely do not produce entries in `HostedCluster.status.version.history` since the cluster CVO version doesn't change. This needs live-cluster verification. Phase 1 records NP completion events from operator observation; HyperShift-sourced NP history deferred to a future phase.
 
+### 9.2 Node-pool version deletion protection — Deferred
+
+Release images are resolved from `ClusterVersion` during reconciliation. The existing deletion protection covers the control-plane `spec.version` reference, but not the proposed `node_sets[*].version` semver string. How should node-pool versions be protected from deletion while in use? Extending that protection is deferred to follow-up work.
+
 ## Test Plan
 
 The test strategy follows the touched-area map for `fulfillment-service` and `osac-operator`.
@@ -629,7 +634,7 @@ The test strategy follows the touched-area map for `fulfillment-service` and `os
 - Initial creation: Cluster and `CanUpgrade=False` are stored together; `READY=True` feedback stores `CanUpgrade=True` while ClusterOrder may still be `Progressing`.
 - NP upgrade end-to-end: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → NP patched → NP completion → CanUpgrade=True + per-NP observed_version.
 - Blocking guard: reject upgrade request on DELETING, DELETE_FAILED, FAILED clusters; reject when CanUpgrade=False.
-- Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version and ReleaseImage match the winner and CanUpgrade=False.
+- Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version matches the winner, `CanUpgrade=False`, and the reconciled `ClusterOrder` image matches that version.
 - Terminal failure releases the lock without changing Cluster or ClusterOrder provisioning status; stale terminal feedback for an earlier target cannot release the lock for a later upgrade.
 - N-3 skew rejection: NP upgrade rejected when skew would exceed 3 minor versions; CP upgrade rejected when it would leave any NP more than 3 minor versions behind.
 - NP version ≤ CP version enforcement: NP upgrade to version > CP rejected.
