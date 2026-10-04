@@ -40,7 +40,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 - After step 1: HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`.
 - After step 2: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PENDING` and `conditions[CAN_UPGRADE].status = False`.
 - After step 3: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
-- After step 5: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`.
+- After step 5: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`, and Cluster/ClusterOrder provisioning status is unchanged.
 
 ---
 
@@ -68,7 +68,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ---
 
-#### TC-FR7-02: Upgrade status reflects Failed state
+#### TC-FR7-02: Terminal upgrade failure releases the upgrade lock
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -76,17 +76,19 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_READY`. `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
+- Cluster in `CLUSTER_STATE_READY`. `observed_cp_version = "4.16.5"`. ClusterVersions `4.17.3` and `4.17.4` ACTIVE.
 
 ##### Steps
 
 1. `PATCH /clusters/{id}` `spec.version = "4.17.3"`.
-2. Simulate operator detecting HostedCluster upgrade failure; sets `upgradeStatus.state = Failed`, `message = "HostedCluster condition Degraded=True: etcd not available"`, signals CLUSTER_STATE_FAILED.
+2. Simulate the operator reporting a terminal upgrade failure (detection criteria TBD): set `upgradeStatus.state = Failed`, `completionTime`, and an upgrade-specific message; send private status feedback.
 3. `GET /clusters/{id}`.
+4. `PATCH /clusters/{id}` with `spec.version = "4.17.4"`, replay the failed result for `4.17.3`, then `GET /clusters/{id}`.
 
 ##### Expected Results
 
-- Step 3: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_FAILED`, `message = "HostedCluster condition Degraded=True: etcd not available"`, `status.state = CLUSTER_STATE_FAILED`, `status.observed_cp_version` remains `"4.16.5"`.
+- Step 3: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_FAILED`, `completed_at` and the upgrade-specific message are set, `conditions[CAN_UPGRADE].status = True`, Cluster state remains READY, ClusterOrder provisioning status is unchanged, and `status.observed_cp_version` remains `"4.16.5"`.
+- Step 4: the new request is accepted; stale feedback does not release its lock. `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PENDING` for `4.17.4` and `conditions[CAN_UPGRADE].status = False`.
 
 ---
 
@@ -189,7 +191,7 @@ FR-10 requires that only one upgrade can be in progress at a time per cluster.
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_FAILED` (previous upgrade or provisioning failed). ClusterVersion `4.17.3` ACTIVE.
+- Cluster in `CLUSTER_STATE_FAILED` because provisioning failed. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 

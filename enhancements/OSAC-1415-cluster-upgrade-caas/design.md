@@ -65,7 +65,7 @@ timeline
 
 ### Phase 1 — Independent upgrades
 
-Control plane and node pools are upgraded independently and sequentially. The operator patches `spec.release.image` on the target `HostedCluster` or `NodePool` directly, bypassing AAP. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
+Control plane and node pools are upgraded independently and sequentially. The operator patches `spec.release.image` on the target `HostedCluster` or `NodePool` directly, bypassing AAP. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades; either terminal upgrade result (success or failure) releases it without changing ClusterOrder provisioning status. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
 
 Upgrades are triggered through `osac edit cluster`, a new `osac upgrade cluster` command, or directly via `PATCH /clusters/{id}`.
 
