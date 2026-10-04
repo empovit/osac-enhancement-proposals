@@ -20,11 +20,11 @@ superseded-by:
 
 ## Summary
 
-This enhancement enables tenants to upgrade HyperShift Hosted Control Plane (HCP) OpenShift clusters through the OSAC API, CLI, and UI. It is delivered in phases. Phase 1 introduces independent, sequential CP and per-NP upgrades with version-skew enforcement, direct HyperShift patching by the osac-operator, and upgrade status/history surfaced from HyperShift. Phase 2 adds upgrade channel management and conditional-update risk review. Later phases add a cancellation window, fleet-level notifications, and attention-state notifications for divergence and EOL conditions.
+This enhancement enables tenants to upgrade HyperShift Hosted Control Plane (HCP) OpenShift clusters through the OSAC API, CLI, and UI. It is delivered in phases. Phase 1 introduces independent, sequential CP and per-NP upgrades with version-skew enforcement, an update-only path in the existing cluster AAP job that applies the selected OpenShift release image, and upgrade status/history surfaced from HyperShift. Phase 2 adds upgrade channel management and conditional-update risk review. Later phases add a cancellation window, fleet-level notifications, and attention-state notifications for divergence and EOL conditions.
 
 ## Motivation
 
-OSAC provisions HyperShift Hosted Control Plane clusters but currently has no API surface for upgrading them. Any change to the release image on `ClusterOrder` triggers a full AAP re-provision. Tenants have no supported upgrade path: any direct edit to a HyperShift CRD is overwritten by OSAC's reconciler to restore the desired state. This enhancement delivers a first-class, governed upgrade workflow.
+OSAC provisions HyperShift Hosted Control Plane clusters but currently has no API surface for upgrading them. The existing AAP create job is also used for scaling; without an upgrade-specific branch, a release-image change would rerun its installation steps. Tenants have no supported upgrade path: any direct edit to a HyperShift CRD is overwritten by OSAC's reconciler to restore the desired state. This enhancement delivers a first-class, governed upgrade workflow.
 
 ### Goals
 
@@ -43,7 +43,7 @@ OSAC provisions HyperShift Hosted Control Plane clusters but currently has no AP
 
 ## Proposal
 
-Cluster upgrades are triggered by **updating a version field on the OSAC `Cluster` resource** — `spec.version` for the control plane, `spec.node_sets[*].version` for a node pool. The fulfillment-service validates the target version, then resolves its release image from `ClusterVersion` when building the `ClusterOrder` CR; the Cluster stores version selectors, not release images. The osac-operator detects image divergence and patches the corresponding HyperShift CRD directly, bypassing AAP. Upgrade progress and history are fed back through the existing Signal RPC.
+Cluster upgrades are triggered by **updating a version field on the OSAC `Cluster` resource** — `spec.version` for the control plane, `spec.node_sets[*].version` for a node pool. The fulfillment-service validates the target version, then resolves its release image from `ClusterVersion` when building the `ClusterOrder` CR; the Cluster stores version selectors, not release images. The osac-operator detects image divergence and launches the existing cluster AAP job with an upgrade operation. Its update-only branch patches `spec.release.image` on the selected existing HyperShift CR. Upgrade progress and history return through the existing private Cluster Update path; `Signal` only schedules reconciliation.
 
 ### Phase overview
 
@@ -51,7 +51,7 @@ Cluster upgrades are triggered by **updating a version field on the OSAC `Cluste
 timeline
     title Cluster Upgrade — CaaS Phases
     Phase 1 : Independent CP and per-NP upgrades
-            : Direct HC/NP patching by operator
+            : Existing AAP job updates the selected HC/NP image
             : N-3 skew enforcement
             : Upgrade status and history
             : CLI and UI support
@@ -65,7 +65,7 @@ timeline
 
 ### Phase 1 — Independent upgrades
 
-Control plane and node pools are upgraded independently and sequentially. The operator patches `spec.release.image` on the target `HostedCluster` or `NodePool` directly, bypassing AAP. All NodePools in OSAC-provisioned HyperShift clusters currently use `spec.management.upgradeType: InPlace` because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades; either terminal upgrade result (success or failure) releases it without changing ClusterOrder provisioning status. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
+Control plane and node pools are upgraded independently and sequentially. As with scaling, the operator launches the existing cluster AAP job. For an upgrade, its update-only branch patches `spec.release.image` on the target existing `HostedCluster` or `NodePool` and skips installation and post-install work. All NodePools in OSAC-provisioned HyperShift clusters currently use `spec.management.upgradeType: InPlace` because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades; either terminal upgrade result (success or failure) releases it without changing ClusterOrder provisioning status. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
 
 Upgrades are triggered through `osac edit cluster`, a new `osac upgrade cluster` command, or directly via `PATCH /clusters/{id}`.
 
@@ -85,7 +85,7 @@ Each phase is additive and backward-compatible with Phase 1 consumers.
 
 ## Version Skew Strategy
 
-The fulfillment-service, osac-operator, and osac-ui are affected across all phases. All three ship in coordinated deployments per phase. New status fields degrade gracefully on older UI builds.
+The fulfillment-service, osac-operator, osac-aap, and osac-ui are affected in Phase 1. They ship in a coordinated deployment with the upgrade branch of the existing AAP job available before upgrade requests are enabled. New status fields degrade gracefully on older UI builds.
 
 ## Support Procedures
 
@@ -93,7 +93,7 @@ Upgrade state is visible in `Cluster.status.upgrade`, `ClusterOrder.status.upgra
 
 ## Infrastructure Needed
 
-- Hub cluster RBAC: `patch`/`update` on `hostedclusters` and `nodepools` (Phase 1).
+- Extend the existing cluster AAP job and any configured workflow with an update-only upgrade branch. The osac-operator retains read-only HyperShift access; the AAP execution identity applies the patch.
 
 ---
 

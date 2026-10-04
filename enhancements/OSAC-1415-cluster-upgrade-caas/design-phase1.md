@@ -20,13 +20,13 @@ superseded-by:
 
 ## Summary
 
-Phase 1 of CaaS cluster upgrades lets tenants independently upgrade the control plane and individual node pools of an HCP OpenShift cluster by patching `Cluster.spec.version` (CP) or `Cluster.spec.node_sets[*].version` (per-NP). The fulfillment-service validates the request and resolves the target version to a release image. The osac-operator detects image divergence on an existing `HostedCluster` or `NodePool` and directly patches `spec.release.image` without triggering AAP re-provision. Only one upgrade operation runs at a time; upgrades are blocked when `Cluster.status.state` is `FAILED`, `DELETING`, or `DELETE_FAILED`, or when `conditions[CanUpgrade]` is not yet `True`.
+Phase 1 of CaaS cluster upgrades lets tenants independently upgrade the control plane and individual node pools of an HCP OpenShift cluster by patching `Cluster.spec.version` (CP) or `Cluster.spec.node_sets[*].version` (per-NP). The fulfillment-service validates the request and resolves the target version to a release image. As with scaling, the osac-operator launches the existing cluster AAP job when an image changes. An upgrade-only branch patches `spec.release.image` on the selected existing `HostedCluster` or `NodePool`; HyperShift then reconciles the upgrade without cluster reprovisioning. Only one upgrade operation runs at a time; upgrades are blocked when `Cluster.status.state` is `FAILED`, `DELETING`, or `DELETE_FAILED`, or when `conditions[CanUpgrade]` is not yet `True`.
 
 ## Motivation
 
-OSAC provisions HyperShift Hosted Control Plane clusters via two control loops: the fulfillment-service projects DB state to `ClusterOrder` CRs, and the osac-operator provisions via AAP. The operator has read-only access to `HostedCluster` and `NodePool`; all mutations — including scaling — are applied through AAP. Tenants have no API surface to upgrade a cluster, and any `releaseImage` change on `ClusterOrder` triggers a full AAP re-provision.
+OSAC provisions HyperShift Hosted Control Plane clusters via two control loops: the fulfillment-service projects DB state to `ClusterOrder` CRs, and the osac-operator provisions via AAP. The operator has read-only access to `HostedCluster` and `NodePool`; all mutations — including scaling — are applied through AAP. Tenants have no API surface to upgrade a cluster. The AAP job used for scaling runs the selected template's `install` role, including infrastructure and readiness tasks, so an unmodified run is too broad for a version-only update.
 
-Phase 1 adds upgrade support by having the osac-operator patch `HostedCluster.spec.release.image` and `NodePool.spec.release.image` directly, bypassing AAP.
+Phase 1 uses the same AAP cluster job as scaling, with an upgrade operation that applies only the release image on the selected existing HyperShift resource. The create/scale operation retains its current path.
 
 ### Goals
 
@@ -38,7 +38,7 @@ Phase 1 adds upgrade support by having the osac-operator patch `HostedCluster.sp
 - Surface upgrade state, observed version, and upgrade history in `Cluster.status`.
 - Support version upgrades via `osac edit cluster` (interactive) and a new non-interactive `osac upgrade cluster` command (`scale cluster` pattern: positional cluster name, `--control-plane` for CP targeting, `--node-set` for NP targeting, `--version` accepting `ClusterVersion.metadata.name` or `ClusterVersion.spec.version` string).
 - Extend the OSAC UI: version selection with pre-filtering (only eligible versions shown — not OBSOLETE; excludes downgrades against current observed version; skew rules applied client-side), upgrade status monitoring, upgrade history, and upgrade action gating (trigger disabled with tooltip when `status.state ∈ {DELETING, DELETE_FAILED, FAILED}` or `conditions[CanUpgrade] != True`, surfacing the blocking reason) [NFR-1].
-- Grant osac-operator write access to `HostedCluster` and `NodePool` resources.
+- Reuse AAP for HyperShift mutations while keeping the osac-operator's `HostedCluster` and `NodePool` access read-only.
 
 ### Non-Goals
 
@@ -53,17 +53,17 @@ Phase 1 adds upgrade support by having the osac-operator patch `HostedCluster.sp
 - Rollback or downgrade.
 - Platform-initiated upgrades.
 - Cancel running upgrades (HyperShift does not support it).
-- AAP playbook changes — Phase 1 upgrades bypass AAP entirely.
+- Running installation, infrastructure, readiness, or post-install tasks for a version-only change.
 - OSAC-owned persistent upgrade history — Phase 1 relays HyperShift's limited history; operator records NP completion.
 
 ## Proposal
 
 Phase 1 adds two independent upgrade paths to the OSAC cluster API:
 
-1. **CP upgrade:** tenant PATCHes `spec.version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.ReleaseImage`; operator detects HC image divergence and patches `HostedCluster.spec.release.image`.
-2. **NP upgrade:** tenant PATCHes `spec.node_sets[<id>].version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage`; operator detects NP image divergence and patches the specific `NodePool.spec.release.image`.
+1. **CP upgrade:** tenant PATCHes `spec.version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.ReleaseImage`; operator detects HC image divergence and launches the existing AAP cluster job in upgrade mode to patch `HostedCluster.spec.release.image`.
+2. **NP upgrade:** tenant PATCHes `spec.node_sets[<id>].version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage`; operator detects NP image divergence and launches the same AAP cluster job in upgrade mode to patch `NodePool.spec.release.image`.
 
-Both paths bypass AAP. Fulfillment sets each node set's desired `ClusterVersionReference` to the selected control-plane version during Cluster creation. It owns the `CanUpgrade` condition in its DB for initial HyperShift creation and upgrades: it sets `False` in the Cluster creation or upgrade-acceptance transaction and `True` in the transaction that records initial cluster readiness or a terminal upgrade result (success or failure). The osac-operator monitors HyperShift and reports status through the existing private Cluster Update path. ClusterOrder provisioning status is not changed by an upgrade.
+Both paths reuse the configured create-hosted-cluster AAP template (or workflow) with an update-only operation; they do not require a new job template. Fulfillment sets each node set's desired `ClusterVersionReference` to the selected control-plane version during Cluster creation. It owns the `CanUpgrade` condition in its DB for initial HyperShift creation and upgrades: it sets `False` in the Cluster creation or upgrade-acceptance transaction and `True` in the transaction that records initial cluster readiness or a terminal upgrade result (success or failure). The osac-operator monitors the AAP job and HyperShift, and reports upgrade status through the existing private Cluster Update path. ClusterOrder provisioning status is not changed by an upgrade.
 
 ### Workflow Description
 
@@ -90,8 +90,10 @@ Cluster Reconciler (cluster_reconciler_function.go)
  ▼
 osac-operator (clusterorder_controller.go)
  │  HC image divergence → CP upgrade path
- │  PATCH HostedCluster.spec.release.image
- │  upgradeStatus.state = Pending
+ │  launch and track existing AAP cluster job in upgrade mode
+ ▼
+AAP create-hosted-cluster playbook (upgrade branch)
+ │  PATCH existing HostedCluster.spec.release.image only
  ▼
 HyperShift Controller
  │  desired.image == ClusterOrder.spec.ReleaseImage → Progressing
@@ -124,8 +126,10 @@ Cluster Reconciler (cluster_reconciler_function.go)
  ▼
 osac-operator (clusterorder_controller.go)
  │  NodePool[i] image divergence → NP upgrade path
- │  PATCH NodePool[i].spec.release.image
- │  upgradeStatus.state = Pending
+ │  launch and track existing AAP cluster job in upgrade mode
+ ▼
+AAP create-hosted-cluster playbook (upgrade branch)
+ │  PATCH existing NodePool[i].spec.release.image only
  ▼
 HyperShift Controller
  │  conditions[UpdatingVersion]=True → upgradeStatus.state = Progressing
@@ -207,29 +211,30 @@ As during cluster creation, the reconciler resolves the selected versions from t
 | `spec.node_sets[i].version` → `ClusterVersion.spec.image` | `spec.nodeRequests[i].ReleaseImage` |
 | `spec.node_sets[i].version` → `ClusterVersion.spec.version` | `spec.nodeRequests[i].Version` |
 
-`ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
+`ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from the existing creation/scaling `DesiredConfigVersion` hash. A version-only change instead triggers an upgrade-mode run of the same AAP template when the operator observes image divergence. Other spec changes continue to drive the creation/scaling lifecycle.
 
-#### Step 4 — osac-operator Image Divergence Detection
+#### Step 4 — osac-operator Upgrade Job Dispatch
 
 **Source file:** `osac-operator/internal/controller/clusterorder_controller.go`
 
 On each reconcile, the operator compares desired vs. observed release images:
 
 - **CP:** `ClusterOrder.spec.ReleaseImage ≠ HostedCluster.spec.release.image` and HC exists → CP upgrade path.
-- **NP:** `ClusterOrder.spec.nodeRequests[i].ReleaseImage ≠ NodePool[i].spec.release.image` and NP exists → NP upgrade path for that pool.
+- **NP:** An existing `NodePool.spec.release.image` differs from the desired `NodeRequest.ReleaseImage` → NP upgrade path.
 
-The API accepted the upgrade only after checking the DB lock for the previous operation. On divergence, the operator patches the existing resource without waiting for HyperShift to match the newly requested target:
+The API accepted the upgrade only after checking the DB lock for the previous operation. On divergence, the operator launches the configured create-hosted-cluster AAP template (or workflow) used by scaling, passing an explicit `upgrade` operation, the `ClusterOrder`, upgrade component, and resolved target image. It records the AAP job ID in `ClusterOrder.status.provisioningJobs` as an upgrade job and polls it as in the scaling path. A job for the same component and target is not launched again while it is running or after its patch succeeded. The operator does not patch the HyperShift resource itself.
 
-- **CP:** `PATCH HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`
-- **NP:** `PATCH NodePool[i].spec.release.image = ClusterOrder.spec.nodeRequests[i].ReleaseImage`
+The existing AAP playbook acquires the per-cluster lease. Its upgrade branch handles either the `HostedCluster` or a `NodePool` with the same image-only patch task under `hypershift.openshift.io/v1beta1` in the working cluster namespace. The control-plane image comes from `ClusterOrder.spec.ReleaseImage`; a node-pool image comes from its `NodeRequest.ReleaseImage`.
 
-`upgradeStatus.state` remains `Pending` after the patch — the operator waits for HyperShift to confirm the upgrade has started.
+Before patching, the playbook verifies that the target resource exists and belongs to the `ClusterOrder`. The shared `kubernetes.core.k8s` task uses `state: patched` with a definition containing only `spec.release.image`, then reads the resource back and asserts that the live image equals the target. The existence check is required because the module can warn yet return successfully for a missing patch target. No AAP job reports patch success for an absent or mismatched target.
 
-If no image divergence exists and no upgrade is in flight, the existing `DesiredConfigVersion` hash comparison drives AAP provisioning (provision path unchanged).
+For this operation the playbook skips the selected template's `install` role, finalizer, infrastructure, secrets, scaling, and readiness waits. If the configured AAP target is the create workflow, its downstream post-install and creation-status playbooks must return without side effects for `operation=upgrade`. A successful AAP job means only that the requested patch was applied; `upgradeStatus.state` remains `Pending` until HyperShift signals that the upgrade has started. The operator keeps its existing read-only HC/NP permissions.
+
+The existing `DesiredConfigVersion` hash comparison still drives AAP provisioning for initial creation and non-version spec changes. Upgrade-mode runs of the shared template are tracked separately from provision/deprovision runs so they cannot satisfy or restart the creation lifecycle.
 
 #### Step 5 — HyperShift Signals Upgrade Started
 
-After the HC or NP patch, the operator monitors for HyperShift's upgrade-started signal on each reconcile:
+After the AAP patch, the operator monitors for HyperShift's upgrade-started signal on each reconcile:
 
 - **CP:** `HC.status.controlPlaneVersion.desired.image == ClusterOrder.spec.ReleaseImage` with a nonempty `desired.version` → set `upgradeStatus.state = Progressing`, `toVersion = desired.version`, `startTime = now`.
 - **NP:** `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
@@ -293,12 +298,18 @@ The feedback controller sends the status through the existing private Cluster Up
 │         OSAC-OPERATOR  (clusterorder_controller.go)                 │
 │  1. Image divergence detected → upgrade path                        │
 │  2. upgradeStatus.state = Pending                                   │
-│  3. PATCH HC or NodePool spec.release.image                          │
-│  4. Monitor: CP desired.image==target / NP Updating=True            │
-│       → upgradeStatus.state = Progressing                           │
-│  5. Monitor target completion → upgradeStatus.state = Succeeded     │
+│  3. Launch/track shared AAP cluster job in upgrade mode              │
+│  4. Monitor HyperShift start → upgradeStatus.state = Progressing     │
+│  5. Monitor target completion → upgradeStatus.state = Succeeded      │
 └────────────────────────┬────────────────────────────────────────────┘
-                         │ NodePool/HostedCluster status watch
+                         │ AAP job launch
+                         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│         EXISTING AAP CLUSTER PLAYBOOK: UPGRADE BRANCH                │
+│  Patch only existing HC or NodePool spec.release.image              │
+│  Return after patch; do not rerun cluster installation              │
+└────────────────────────┬────────────────────────────────────────────┘
+                         │ HyperShift resource change
                          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │              HYPERSHIFT CONTROLLER                                  │
@@ -335,7 +346,7 @@ stateDiagram-v2
 
 **API-level blocking:** Upgrade requests are rejected if `state ∈ {DELETING, DELETE_FAILED, FAILED}`, or if the DB's `conditions[CanUpgrade].status != True`. Fulfillment sets this per-cluster lock to `False` in the Cluster creation or upgrade-acceptance transaction and to `True` in the corresponding feedback transaction. `PROGRESSING + CanUpgrade=True` allows upgrades — the Cluster `READY` condition can be True while AAP post-provisioning tasks are still running.
 
-**Cluster-internal health states are not an API gate.** HC degraded, CP temporarily unreachable, or NP unhealthy do not affect `CanUpgrade`. If an upgrade is submitted while these conditions are true, the API accepts it and the operator patches HC/NP. Whether the upgrade succeeds depends on HyperShift.
+**Cluster-internal health states are not an API gate.** HC degraded, CP temporarily unreachable, or NP unhealthy do not affect `CanUpgrade`. If an upgrade is submitted while these conditions are true, the API accepts it and AAP applies the requested HC/NP patch. Whether the upgrade succeeds depends on HyperShift.
 
 
 ### API Extensions
@@ -409,6 +420,7 @@ type NodeRequest struct {
 ```go
 type ClusterOrderStatus struct {
     // ... existing fields ...
+    // Existing ProvisioningJobs also records upgrade jobs by JobTypeUpgrade.
     ObservedVersion string                `json:"observedVersion,omitempty"`
     UpgradeStatus   *ClusterUpgradeStatus `json:"upgradeStatus,omitempty"`
 }
@@ -442,6 +454,8 @@ const (
     UpgradeStateFailed      UpgradeStateType = "Failed"
 )
 ```
+
+Extend `JobType` in `osac-operator/api/v1alpha1/job_types.go` with `upgrade` and update its CRD enum. An upgrade `JobStatus` uses `Target` for `control_plane` or `node_pool:<id>` and `ConfigVersion` for a stable fingerprint of the component and target image. This keeps its AAP job ID, state, and retry history in the existing `ClusterOrder.status.provisioningJobs` list without treating it as a provision job.
 
 `ClusterVersionReference.name` remains in desired CP and node-set specs for catalog lookup and release-image resolution. CP target semver comes from the resolved `ClusterVersion.spec.version` at API acceptance and from `HostedCluster.status.controlPlaneVersion.desired.version` once its desired image matches the requested image. NP target semver comes from the resolved `ClusterVersion.spec.version` in `NodeRequest.Version`. `ClusterOrder` and `Cluster` status and history use those OpenShift semver values, including `FromVersion` and `ToVersion`.
 
@@ -486,14 +500,14 @@ For version updates, move the `validateClusterStateForSpecUpdate` state check af
 
 Fulfillment initializes `CanUpgrade=False` and copies the selected `spec.version` reference to every `spec.node_sets[*].version` in the same transaction that creates the Cluster; a node-set reference resolving to a different ClusterVersion on Create is rejected. For initial provisioning, the feedback controller sends the existing `ClusterAvailable` observation as `Cluster.status.conditions[READY]` through private Cluster Update. Fulfillment locks the Cluster row and stores `READY=True`, `status.observed_cp_version`, every `status.node_sets[*].observed_version`, and `CanUpgrade=True` in one transaction only while `status.upgrade` is unset. The observed baselines come from the selected `ClusterVersion.spec.version`; provisioning changes status, not the desired references. Later HC/NP health changes do not change the lock.
 
-For an upgrade, the API stores the target and takes the DB lock in one acceptance transaction. The operator patches HC/NP while `CanUpgrade=False` and reports progress through private status feedback. The private Cluster Update handler releases the DB lock in the transaction that records success or terminal failure for the current component and target version.
+For an upgrade, the API stores the target and takes the DB lock in one acceptance transaction. The operator launches and tracks the AAP patch job while `CanUpgrade=False`, then reports HyperShift progress through private status feedback. The private Cluster Update handler releases the DB lock in the transaction that records success or terminal failure for the current component and target version.
 
 #### buildSpec change in fulfillment-service reconciler
 
 `buildSpec` in `fulfillment-service/internal/controllers/cluster/cluster_reconciler_function.go`:
 - Resolves `Cluster.spec.version` to `ClusterVersion.spec.image`, as during creation, and sets `ClusterOrder.spec.ReleaseImage` (CP image).
 - Resolves each `Cluster.spec.node_sets[<id>].version` reference to `ClusterVersion.spec.image` and `ClusterVersion.spec.version`, then sets `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage` (pullspec) and `ClusterOrder.spec.nodeRequests[<id>].Version` (semver). No resolved image is stored on `Cluster`.
-- `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
+- `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from the creation/scaling `DesiredConfigVersion` hash. Image divergence triggers an upgrade-mode run of the same configured AAP template, with independent job tracking.
 
 #### osac-operator upgrade reconciliation
 
@@ -502,28 +516,29 @@ In `clusterorder_controller.go`, the reconcile loop gains upgrade awareness:
 **CP upgrade path:**
 1. Compare `ClusterOrder.spec.ReleaseImage` with `HostedCluster.spec.release.image`. If HC exists and images differ → CP upgrade path.
 2. Set `upgradeStatus = {state: Pending, component: "control_plane", fromVersion: observedVersion}`; fulfillment retains the accepted target semver while HyperShift has not reported it.
-3. Patch `HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`; state remains `Pending`.
+3. Launch or poll the configured cluster AAP job in `upgrade` mode for `control_plane` and `ClusterOrder.spec.ReleaseImage`; state remains `Pending` until HyperShift confirms a start.
 4. Monitor: when `HC.status.controlPlaneVersion.desired.image == ClusterOrder.spec.ReleaseImage` and `desired.version` is nonempty → set `upgradeStatus.state = Progressing`, `toVersion = desired.version`, `startTime = now`; fulfillment checks that semver against the accepted target.
 5. Monitor completion: `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage`, `history[0].version == HC.status.controlPlaneVersion.desired.version`, AND `history[0].state == "Completed"`.
 6. On completion: set `status.observedVersion` from `HC.status.controlPlaneVersion.history[0].version`; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
 **NP upgrade path:**
-1. Compare `ClusterOrder.spec.nodeRequests[i].ReleaseImage` with `NodePool[i].spec.release.image`. If NP exists and images differ → NP upgrade path for that pool.
+1. Detect NP image divergence between desired `NodeRequest.ReleaseImage` and existing `NodePool.spec.release.image`.
 2. Set `upgradeStatus = {state: Pending, component: "node_pool:<id>", fromVersion: observed, toVersion: nodeRequests[i].Version}`.
-3. Patch `NodePool[i].spec.release.image = nodeRequests[i].ReleaseImage`; state remains `Pending`.
+3. Launch or poll the configured cluster AAP job in `upgrade` mode for `node_pool:<id>` and `nodeRequests[i].ReleaseImage`; state remains `Pending` until HyperShift confirms a start.
 4. Monitor: when `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
 5. Monitor completion: `NodePool[i].status.conditions[UpdatingVersion].status == False` AND `NodePool[i].status.version == ClusterOrder.spec.nodeRequests[i].Version`.
 6. On completion: set `node_sets[i].observed_version` from `NodePool[i].status.version` in the feedback payload; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
-**Provision path** (unchanged): if HC does not yet exist or no image divergence on HC or any NP, the existing `DesiredConfigVersion` hash comparison drives AAP provisioning.
+**Job coordination:** Extend the existing AAP provider with an upgrade-mode launch using its configured cluster create template and existing job-status polling methods; no new AAP template is needed. Pass `osac_job_vars.operation=upgrade` and the selected component/image as launch variables rather than inferring the operation from image divergence inside Ansible. Omitted operation retains the existing create/scale behavior for older callers. Use the provisioning lifecycle's job polling/duplicate-guard pattern, with `JobTypeUpgrade` distinct from `JobTypeProvision` because an AAP patch result is not an installation result. Persist the launched job ID promptly; on restart, poll the recorded job instead of launching another. Do not launch an upgrade-mode run while a create/scale run is nonterminal, or vice versa; re-evaluate the latest ClusterOrder spec after the active job finishes. A running job or a successful patch for the same component and image suppresses duplicate launches. A failed AAP job is retried with backoff only for retryable patch errors while the selected resource still has the old image; a missing or mismatched target is terminal. AAP success alone never marks the HyperShift upgrade `Progressing` or `Succeeded`.
 
-RBAC marker expanded:
+**Provision path:** if HC does not yet exist, or a non-version spec change alters `DesiredConfigVersion`, the existing create-hosted-cluster lifecycle applies. Version-only changes leave that hash unchanged. If a create/scale job is already running when an upgrade is accepted, wait for it to finish and recheck image divergence before launching the upgrade-mode run. Defer newly detected non-version changes while the upgrade is Pending or Progressing, then re-evaluate their hash after a terminal upgrade result; neither job's result satisfies the other lifecycle. The creation/scaling playbook must render each NodePool's `spec.release.image` from its own `nodeRequests[i].ReleaseImage` (falling back to the control-plane image for older ClusterOrders); otherwise a later scale operation could overwrite a pool's independently selected version.
 
-```go
-// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters;nodepools,verbs=get;list;watch;patch;update
-```
+#### osac-aap upgrade branch in the existing cluster playbook
 
-NodePools are discovered by listing within the cluster's namespace by `osac.openshift.io/resource_class` label selector.
+Extend `playbook_osac_create_hosted_cluster.yml` with a guarded `upgrade` branch that uses the existing cluster-fulfillment inventory, execution environment, and cluster lease. The operator passes the `ClusterOrder`, `operation=upgrade`, component, and catalog-resolved image as launch variables. Preflight existence and association checks, the image-only patch, and readback use the same tasks for HC and NP. The branch fails without a patch if the target resource is absent or mismatched; it must not create a replacement. It returns after confirming the image, leaving HyperShift to reconcile asynchronously. Keep only name, namespace, and lease setup common to both operations; skip `write_ssh_keys`, `cluster_settings`, `extract_template_info`, infrastructure finalizers, and the selected template's `install` role for upgrades. Those existing tasks resolve installation inputs or alter other resources. If the deployment configures the AAP create workflow rather than the job template, add upgrade guards to `playbook_osac_create_hosted_cluster_post_install.yml` and `playbook_osac_report_hosted_cluster_status.yml` so their tasks have no side effects and do not report creation success or failure.
+
+The osac-operator keeps its current read-only RBAC on `hostedclusters` and `nodepools`; the AAP execution identity already used for cluster creation performs this mutation.
+
 
 #### HyperShift status fields used
 
@@ -552,9 +567,9 @@ No `HostedControlPlane` watch needed — all CP status is on `HostedCluster`.
 ### Security Considerations
 
 - Upgrade requests pass through existing tenant RBAC: only tenants with `Update` permission on their `Cluster` resource can initiate upgrades.
-- The osac-operator service account requires expanded RBAC on `hypershift.openshift.io/hostedclusters` and `hypershift.openshift.io/nodepools` (patch/update). These are hub-cluster permissions managed through the existing RBAC marker pattern.
+- The osac-operator retains read-only access to `hypershift.openshift.io/hostedclusters` and `hypershift.openshift.io/nodepools`. The existing AAP cluster template uses the cluster-fulfillment execution identity for the narrowly scoped patch.
 - Target version images are resolved exclusively from the OSAC ClusterVersion catalog; tenants cannot inject arbitrary OCI pullspecs.
-- Tenant isolation is preserved: `ClusterOrder` resources are labeled with `osac.openshift.io/tenant`, enforced by existing OPA policies.
+- Tenant isolation is preserved: `ClusterOrder` carries the `osac.openshift.io/tenant` annotation, enforced by existing OPA policies. The playbook verifies the target's ClusterOrder association label and namespace before patching.
 
 ### HyperShift Upgrade Failure Surfacing
 
@@ -566,8 +581,10 @@ At Phase 1, it is the **tenant's responsibility** to verify that a target versio
 
 | Failure mode | What happens | Recovery | User observes |
 |---|---|---|---|
-| Retryable HC or NP patch error | Operator retries on next reconcile with backoff. `upgradeStatus.state` remains `Pending`. | Resolve underlying issue; operator resumes automatically. | Upgrade remains Pending. |
-| Operator crashes mid-upgrade | On restart, operator re-reads `ClusterOrder.spec.ReleaseImage` and `nodeRequests[*].ReleaseImage` and resumes. Patch calls are idempotent. | Automatic on restart. | Brief gap in status updates. |
+| AAP template missing, launch failure, or retryable HC/NP patch error | Operator records the AAP error and retries the upgrade-mode run of the configured cluster template with backoff while the target image still differs. `upgradeStatus.state` remains `Pending`. | Restore AAP/template or hub API access; the operator resumes automatically. | Upgrade remains Pending with an upgrade-specific message. |
+| Target HC/NP is absent or associated with another order | The preflight fails without a patch. The operator records a terminal upgrade failure and fulfillment releases `CanUpgrade` without changing provisioning state. | Restore or correctly associate the existing resource, then submit a new upgrade request. | `status.upgrade.state = Failed` with the target-validation error. |
+| Operator crashes mid-upgrade | On restart, operator re-reads `ClusterOrder.spec.ReleaseImage`, `nodeRequests[*].ReleaseImage`, the recorded AAP upgrade job, and HC/NP state. It polls an active job or observes an already-applied patch rather than relaunching it. | Automatic on restart; patch is idempotent. | Brief gap in status updates. |
+| AAP patch job succeeds but HyperShift has not started or completed | Job success records only that the release-image patch was applied. | HyperShift reconciles asynchronously; operator continues watching HC/NP status. | Upgrade remains Pending until HyperShift signals start, then Progressing until completion. |
 | Catalog lookup fails during reconciliation | `ClusterOrder` is not updated; reconciliation retries and the accepted upgrade remains Pending. | Restore catalog access; node-pool version deletion protection is deferred (Open Question 9.2). | Upgrade remains Pending. |
 | Terminal upgrade failure (criteria TBD) | Upgrade cannot proceed; operator sets `upgradeStatus.state = Failed` without changing ClusterOrder provisioning status. Fulfillment sets `CanUpgrade=True` when it records the result. | Investigate the upgrade failure; recovery details follow the terminal-failure criteria. | `status.upgrade.state = Failed` with message; Cluster state is unchanged. |
 | Target version not found in the ClusterVersion catalog | Rejected at `validateVersionUpdate`. | User specifies a valid version name. | `INVALID_ARGUMENT` with message. |
@@ -578,27 +595,35 @@ At Phase 1, it is the **tenant's responsibility** to verify that a target versio
 ### RBAC / Tenancy
 
 - No changes to the fulfillment-service tenant RBAC model.
-- osac-operator service account RBAC expanded: `patch` and `update` verbs on `hostedclusters` and `nodepools`.
+- No new osac-operator write permissions on `hostedclusters` or `nodepools`; AAP's cluster-fulfillment identity performs the patch.
 - Feedback uses the existing private Cluster Update path for upgrade status; `Signal` remains unchanged and carries only the cluster ID.
 - No changes to OPA policies; upgrade operations are gated by the existing `Update` verb on `Cluster`.
 
 ### Observability and Monitoring
 
-- `ClusterOrder.status.upgradeStatus` provides operator-level upgrade visibility.
+- `ClusterOrder.status.upgradeStatus` and the upgrade-typed entry in `status.provisioningJobs` provide HyperShift and AAP job visibility separately.
 - The osac-operator emits a Kubernetes Event on the `ClusterOrder` when an upgrade starts, transitions to Progressing, completes, or fails (`Normal` for start/Progressing/complete, `Warning` for failure).
 
 ### Risks and Mitigations
 
 | Risk | Mitigation |
 |---|---|
-| `ReleaseImage` hash exclusion triggers spurious AAP re-provision on controller upgrade | Validate in staging: upgrade the controller on a live cluster and verify no AAP jobs are triggered. |
+| Hash exclusions cause the upgrade to be missed | Test divergence routing, operation variables, and the unchanged creation/scaling hash after a controller upgrade on a live cluster. |
+| A later scaling job resets an independently upgraded NodePool image | Render each NodePool from its own `nodeRequests[i].ReleaseImage`; test upgrade followed by scale with unequal CP/NP versions. |
+| AAP job succeeds before HyperShift has completed, or a reconcile launches duplicate patch jobs | Keep AAP job state separate from upgrade state; persist and poll the upgrade job ID and gate relaunches by component and target image. |
 | HyperShift `controlPlaneVersion.history` is capped at 100 entries | Phase 1 relays up to 100 entries; operator-owned history (DB-backed) deferred to a future phase. |
 | NP history not available from HyperShift | Operator records NP completion events directly at transition time. |
-| Operator has expanded RBAC on HC/NP (write access) | Scope is limited to `patch`/`update` on `hostedclusters`/`nodepools` in the managed namespaces only. |
+| Upgrade-mode AAP run may race with a scaling run | The operator waits for the other job type to finish before launch, re-evaluates the current ClusterOrder spec, and both operations use the same per-cluster lease. |
 
 ### Drawbacks
 
-OSAC enforces one operation at a time (no concurrent NP upgrades across different pools). A cluster with multiple node pools cannot run NP upgrades in parallel; each upgrade must complete before the next is accepted.
+OSAC enforces one operation at a time (no concurrent NP upgrades across different pools). A cluster with multiple node pools cannot run NP upgrades in parallel; each upgrade must complete before the next is accepted. The AAP hop adds job scheduling latency and another failure point, but retains one controlled mutation path for HyperShift resources.
+
+## Alternatives (Not Implemented)
+
+**Direct osac-operator patching:** The operator could write `HostedCluster` and `NodePool` release images itself, avoiding AAP job latency. That would expand its hub-cluster RBAC, add a second HyperShift mutation path alongside scaling, and require separate coordination with AAP's cluster lease and create workflow. Reusing the AAP cluster job keeps mutations and serialization on the existing path.
+
+**Run the unmodified create-hosted-cluster job for upgrades:** The current scaling path reapplies the whole cluster template and runs infrastructure, readiness, and potentially post-install tasks. It also renders every NodePool image from the CP image. The chosen upgrade branch limits a version-only run to the selected release image; the create/scale branch is updated to preserve per-NP images on later scaling.
 
 ## Open Questions
 
@@ -612,60 +637,62 @@ Release images are resolved from `ClusterVersion` during reconciliation. The exi
 
 ## Test Plan
 
-The test strategy follows the touched-area map for `fulfillment-service` and `osac-operator`.
+The test strategy follows the touched-area maps for `fulfillment-service`, `osac-operator`, and `osac-aap` and the tier/owner assignments in `testplan-phase1.md`.
 
 **Unit tests:**
 - `validateVersionUpdate` — CP upgrade: target > current, not OBSOLETE, N-3 skew against existing NPs, and state/lock eligibility.
 - `validateNPVersionUpdate` — NP upgrade: target ≤ CP, N-3 skew, target > NP current, and state/lock eligibility.
-- `buildSpec` — CP and per-NP image resolution from ClusterVersion catalog.
-- Operator upgrade path: image divergence detection, upgrade vs. provision routing.
+- `buildSpec` — CP and per-NP image resolution from the ClusterVersion catalog.
+- Operator upgrade path: image divergence detection, upgrade-mode job deduplication/retry, and upgrade vs. provision routing to the same configured AAP template.
 - DB-owned lock: Cluster creation and upgrade acceptance each store `CanUpgrade=False` with the operation; HyperShift cluster initial readiness or terminal upgrade feedback (success or failure) stores `True` with status in one transaction. Migration seeds existing rows from `READY=True`, including `PROGRESSING` clusters; other rows get `False`.
-- `DesiredConfigVersion` hash exclusion: version-only change does not trigger AAP.
+- `DesiredConfigVersion` hash exclusion: version-only changes trigger the upgrade branch of the configured AAP template.
 
 **Integration tests:**
-- CP upgrade end-to-end: PATCH spec.version → CanUpgrade=False (sync DB write) → ClusterOrder sync → operator patches HC → completion detected → CanUpgrade=True + history entry.
+- CP upgrade: PATCH spec.version → CanUpgrade=False (sync DB write) → ClusterOrder sync → operator launches the existing AAP cluster job in upgrade mode → playbook patches HC only → HyperShift completion detected → CanUpgrade=True + history entry.
 - Initial creation and migration: node-set version references and `CanUpgrade=False` are stored with the Cluster; `READY=True` feedback or migration stores all observed semver baselines with `CanUpgrade=True` while ClusterOrder may still be `Progressing`.
-- NP upgrade end-to-end: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → NP patched → NP completion → CanUpgrade=True + per-NP observed_version.
+- NP upgrade: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → AAP patches only the selected NP → NP completion → CanUpgrade=True + per-NP observed_version.
+- AAP playbook against Kind: missing/mismatched HC or NP fails without creation; an upgrade-mode run patches only `spec.release.image` on the selected resource and skips install/post-install tasks. A later scaling job preserves the NP-specific image.
+- AAP job success before HyperShift starts leaves the upgrade Pending; a failed patch run retries with backoff through the configured template's upgrade branch.
 - Blocking guard: reject upgrade request on DELETING, DELETE_FAILED, FAILED clusters; reject when CanUpgrade=False.
 - Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version matches the winner, `CanUpgrade=False`, and the reconciled `ClusterOrder` image matches that version.
 - Terminal failure releases the lock without changing Cluster or ClusterOrder provisioning status; stale terminal feedback for an earlier target cannot release the lock for a later upgrade.
 - N-3 skew rejection: NP upgrade rejected when skew would exceed 3 minor versions; CP upgrade rejected when it would leave any NP more than 3 minor versions behind.
 - NP version ≤ CP version enforcement: NP upgrade to version > CP rejected.
 
-**E2E tests:** see `testplan-phase1.md` for detailed test cases. Key scenarios: CP upgrade on a live cluster, per-NP upgrade, version skew rejection, concurrent-upgrade rejection, and terminal upgrade failure with unchanged provisioning state.
+**E2E tests:** see `testplan-phase1.md` for detailed test cases. Key scenarios: CP upgrade on a live cluster, per-NP upgrade through AAP, later scaling preserving the NP image, version skew rejection, concurrent-upgrade rejection, and terminal upgrade failure with unchanged provisioning state.
 
 ## Graduation Criteria
 
 - Stable CP and per-NP upgrades via the OSAC API, CLI, and UI.
 - Correct upgrade state and history surfaced in `Cluster.status`.
 - N-3 skew and downgrade rejection validated by integration tests.
-- RBAC expansion for osac-operator documented and audited.
+- Existing AAP cluster template's upgrade branch exercised without granting the osac-operator HC/NP write permissions or rerunning cluster creation.
 - DB backfill migration applied and verified on pre-existing clusters.
 
 ## Upgrade / Downgrade Strategy
 
-A DB migration backfills observed semver versions for pre-existing ready clusters (see DB migration in API Extensions). The new `ClusterStatus` fields are additive and backward-compatible. The `ReleaseImage` and node-request version hash exclusions are behavioral changes to the provisioning path; they must be validated on rollout to prevent spurious AAP re-provision jobs.
+A DB migration backfills observed semver versions for pre-existing ready clusters (see DB migration in API Extensions). The new `ClusterStatus` fields are additive and backward-compatible. Deploy the existing AAP template's upgrade branch and creation-path per-NP image handling before enabling upgrade requests. Validate on rollout that version-only changes launch the upgrade branch, never the installation branch.
 
 ## Version Skew Strategy
 
-The fulfillment-service, osac-operator, and osac-ui are affected. All three ship in the same coordinated deployment. The osac-ui generates types from the same protos; new status fields degrade gracefully (no display) on older UI builds.
+The fulfillment-service, osac-operator, osac-aap, and osac-ui are affected. They ship in a coordinated deployment, with the existing AAP template's upgrade branch available before upgrade requests are enabled. The osac-ui generates types from the same protos; new status fields degrade gracefully (no display) on older UI builds.
 
 ## Support Procedures
 
 ### Detection
 
-- Upgrade state is visible in `Cluster.status.upgrade` and `ClusterOrder.status.upgradeStatus`.
+- Upgrade state is visible in `Cluster.status.upgrade` and `ClusterOrder.status.upgradeStatus`; AAP launch and patch failures are visible in the upgrade-typed `ClusterOrder.status.provisioningJobs` entry.
 - Stuck upgrades (Progressing for > expected duration) surface via Kubernetes Events on `ClusterOrder`.
 - Operator logs structured entries with cluster ID, component, and version on every state transition.
 
 ### Recovery
 
 - A terminal failure releases `CanUpgrade`; investigate the upgrade-specific reason before starting another upgrade.
-- If the operator is stuck (persistent HC/NP API errors), resolve the underlying hub-cluster API issue; the operator resumes automatically on reconnection.
+- If the operator is stuck on AAP launch or patch errors, inspect the upgrade-mode job and hub-cluster API access, resolve the underlying issue, and let the operator retry.
 
 ## Infrastructure Needed
 
-- Hub cluster RBAC: `patch`/`update` on `hostedclusters` and `nodepools` for the osac-operator service account.
+- Extend the configured cluster AAP job template and, where configured, its workflow with an upgrade branch. The osac-operator retains read-only HyperShift RBAC.
 - No new external services or infrastructure.
 
 ---

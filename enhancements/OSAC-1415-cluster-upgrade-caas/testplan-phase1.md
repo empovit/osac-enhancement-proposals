@@ -3,11 +3,20 @@
 ## Overview
 
 - **Feature:** OSAC-1415 — Cluster Upgrade CaaS (Stage 1)
-- **Total test cases:** 44
+- **Total test cases:** 47
 - **Requirements with test cases:** 7 of 8 (FR-7, FR-8, FR-10, FR-11, FR-12, FR-13, NFR-1); NFR-2 is documentation
 - **Interface changes covered:** 9 of 9 (IC-1 through IC-9)
 
 PATCH steps below use semantic versions as shorthand; CP and NP desired versions are both `ClusterVersionReference` values on the wire, while observed versions are semver strings.
+
+### Upgrade-path coverage and ownership
+
+| Behavior / cases | Tier and owner | Boundary and execution evidence |
+|---|---|---|
+| Upgrade-mode routing, job idempotency, feedback (`TC-IC1-01`, `TC-IC1-01c`, `TC-IC2-01`, `TC-FR7-01`) | Envtest, osac-operator `[DEV]` | `make test` in `osac-operator/`; real Kubernetes API and controller, fake AAP client and simulated HyperShift status. This does not prove the AAP service boundary. |
+| Shared HC/NP image patch, missing-target failure, later scale preserving per-NP image (`TC-IC1-01`, `TC-IC2-01`, `TC-IC2-01b`, `TC-IC2-01c`) | Component integration, osac-aap `[DEV]` | Proposed target under `osac-aap/tests/integration/targets/`, run by `make test` in `osac-aap/`; real Kind API and Ansible tasks, no real AAP controller or HyperShift reconciliation. |
+| AAP template launch, polling, and retry (`TC-IC1-01c`) | Contract, osac-operator/osac-aap `[DEV]` | No qualifying real-AAP contract suite is currently identified; follow [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). A fake AAP client in Envtest covers caller logic only. |
+| Deployed CP/NP upgrade and later scale (`TC-IC1-01`, `TC-IC2-01`, `TC-IC2-01b`) | E2E, `[QE]` | Proposed cases under `tests/e2e/` require deployed fulfillment-service, operator, AAP, and HyperShift; execution command and environment are unresolved pending the provider test setup in [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). |
 
 ---
 
@@ -33,17 +42,19 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 1. `PATCH /clusters/{id}` with `spec.version = "4.17.3"`.
 2. `GET /clusters/{id}` immediately after.
-3. Simulate operator setting `upgradeStatus.state = Progressing` and sending private status feedback.
-4. `GET /clusters/{id}`.
-5. Simulate operator completing upgrade: sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, and sends private status feedback.
-6. `GET /clusters/{id}`.
+3. Simulate successful completion of the AAP patch job, then `GET /clusters/{id}`.
+4. Simulate HyperShift signaling upgrade start; operator sets `upgradeStatus.state = Progressing` and sends private status feedback.
+5. `GET /clusters/{id}`.
+6. Simulate HyperShift completion; operator sets `upgradeStatus.state = Succeeded`, `completionTime`, `observedVersion = "4.17.3"`, and sends private status feedback.
+7. `GET /clusters/{id}`.
 
 ##### Expected Results
 
 - After step 1: HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`.
 - After step 2: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PENDING` and `conditions[CAN_UPGRADE].status = False`.
-- After step 4: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
-- After step 6: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`, and Cluster/ClusterOrder provisioning status is unchanged.
+- After step 3: `status.upgrade.state` is still `CLUSTER_UPGRADE_PROGRESS_STATE_PENDING`; AAP job success alone does not indicate HyperShift progress.
+- After step 5: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_PROGRESSING`, `from_version = "4.16.5"`, `to_version = "4.17.3"`, `started_at` is non-zero, `completed_at` is absent.
+- After step 7: `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `completed_at` is non-zero, `conditions[CAN_UPGRADE].status = True`, `status.observed_cp_version = "4.17.3"`, and Cluster/ClusterOrder provisioning status is unchanged.
 
 ---
 
@@ -283,7 +294,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ### IC-1: `PATCH /clusters/{id}` spec.version — CP upgrade trigger and validation
 
-#### TC-IC1-01: CP upgrade on READY cluster patches HC only
+#### TC-IC1-01: CP upgrade on READY cluster patches HC through AAP only
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -296,10 +307,11 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 ##### Steps
 
 1. `PATCH /clusters/{id}` `spec.version = "4.17.3"`.
+2. Reconcile the ClusterOrder and run the existing cluster AAP job in upgrade mode against the HC.
 
 ##### Expected Results
 
-- HTTP 200. `ClusterOrder.spec.ReleaseImage` updated to the image from ClusterVersion `4.17.3`. Operator patches `HostedCluster.spec.release.image` only. `NodePool.spec.release.image` values are not changed by this operation. Cluster state unchanged; `conditions[CAN_UPGRADE].status = False` written in the same transaction.
+- HTTP 200. `ClusterOrder.spec.ReleaseImage` is updated to the image from ClusterVersion `4.17.3`. The operator launches the configured create-hosted-cluster AAP template once in upgrade mode and does not patch HC itself. The playbook finds the existing HC, patches only `HostedCluster.spec.release.image`, and reads it back to confirm the target image; its install/post-install tasks do not run, and `NodePool.spec.release.image` values and other HC fields do not change. Cluster state is unchanged; `conditions[CAN_UPGRADE].status = False` is written in the acceptance transaction.
 
 ---
 
@@ -322,6 +334,29 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 - One request returns HTTP 200; the other returns `FAILED_PRECONDITION` with the `CanUpgrade` reason.
 - The stored Cluster version matches the successful request and has no stored release image; `CanUpgrade=False`. The reconciled `ClusterOrder.spec.ReleaseImage` matches that version's `ClusterVersion.spec.image`. The rejected request changes nothing.
+
+---
+
+#### TC-IC1-01c: AAP upgrade-mode run failure retries without cluster reprovisioning
+
+| Interface Change | Priority | Automation |
+|-----------------|----------|------------|
+| IC-1 | critical | automated |
+
+##### Preconditions
+
+- A CP upgrade to `4.17.3` is Pending. The existing HC still has the old image, and no upgrade job has succeeded for this target.
+
+##### Steps
+
+1. Reconcile once with the configured cluster AAP template unavailable; restore it and reconcile again.
+2. Fail the launched AAP job before it patches HC; reconcile through the configured retry backoff.
+3. Let the retried job patch HC successfully; restart the operator and reconcile again before HyperShift reports progress.
+
+##### Expected Results
+
+- Launch and patch failures retain `status.upgrade.state = Pending`, keep `CanUpgrade=False`, and expose an upgrade-specific message. The operator retries the configured AAP template in upgrade mode with backoff; its installation branch does not run.
+- The recorded job ID prevents a duplicate launch while the job is active. After the image matches, restart does not launch another job. AAP job success alone leaves the upgrade Pending until HyperShift signals a start; ClusterOrder provisioning status is unchanged.
 
 ---
 
@@ -546,7 +581,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`. `ControlPlaneAvailable=False` is a cluster-internal state not captured by `CanUpgrade` — the upgrade is accepted and the operator attempts to patch HC. Whether the patch succeeds depends on HyperShift's responsiveness.
+- HTTP 200, cluster state unchanged (READY), `conditions[CAN_UPGRADE].status = False`. `ControlPlaneAvailable=False` is a cluster-internal state not captured by `CanUpgrade` — the upgrade is accepted and the operator launches the AAP patch job. Whether HyperShift progresses depends on its responsiveness.
 
 ---
 
@@ -572,7 +607,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ### IC-2: `PATCH /clusters/{id}` spec.node_sets[*].version — NP upgrade trigger and validation
 
-#### TC-IC2-01: NP upgrade on READY cluster patches the target NodePool only
+#### TC-IC2-01: NP upgrade on READY cluster patches the target NodePool through AAP only
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -585,10 +620,56 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 ##### Steps
 
 1. `PATCH /clusters/{id}` `spec.node_sets["workers"].version = "4.17.3"`.
+2. Reconcile the ClusterOrder and run the existing cluster AAP job in upgrade mode for the NP upgrade.
 
 ##### Expected Results
 
-- HTTP 200. `ClusterOrder.spec.nodeRequests["workers"].ReleaseImage` updated to the image from ClusterVersion `4.17.3`. Operator patches `NodePool["workers"].spec.release.image` only. `HostedCluster.spec.release.image` and the other `NodePool.spec.release.image` are not changed. Cluster state unchanged; `conditions[CAN_UPGRADE].status = False` written in the same transaction.
+- HTTP 200. The `ClusterOrder` carries the image from ClusterVersion `4.17.3` for the NP upgrade. The operator launches the configured create-hosted-cluster AAP template once in upgrade mode and does not patch the NP itself. The playbook verifies the existing NodePool's ClusterOrder association, patches only its `spec.release.image`, and reads it back to confirm the target image. Install/post-install tasks do not run, and `HostedCluster.spec.release.image`, the other NodePool image, and other NP fields do not change. Cluster state is unchanged; `conditions[CAN_UPGRADE].status = False` is written in the acceptance transaction.
+
+---
+
+#### TC-IC2-01b: Later scaling preserves an independently upgraded NodePool image
+
+| Interface Change | Priority | Automation |
+|-----------------|----------|------------|
+| IC-2 | high | automated |
+
+##### Preconditions
+
+- The CP and another NP are at `4.18.0`; `workers` completed an independent upgrade from `4.16.5` to `4.17.3`, and its `NodeRequest` contains the `4.17.3` image.
+
+##### Steps
+
+1. Change only `workers` desired node count to trigger the existing scaling/create-hosted-cluster AAP path.
+2. Run the scaling playbook and read the HC and both NodePool specs.
+
+##### Expected Results
+
+- Scaling changes the replica count without resetting `workers.spec.release.image` from `4.17.3` to the CP's `4.18.0` image. The HC and other NP images remain unchanged, and no upgrade job is launched for the scale-only change.
+
+---
+
+#### TC-IC2-01c: Shared upgrade patch fails for missing or mismatched HC and NP
+
+| Interface Change | Priority | Automation |
+|-----------------|----------|------------|
+| IC-1, IC-2 | high | automated |
+
+##### Preconditions
+
+- A component-integration environment has the cluster working namespace, a `ClusterOrder`, and a valid CP or NP upgrade-mode payload.
+
+##### Steps
+
+1. Run the shared upgrade patch with the selected HC absent; repeat with the selected NP absent.
+2. Create HC and NP resources with a mismatched ClusterOrder association, then repeat each patch.
+3. Run the CP and NP patches against correctly associated resources, then read both resources.
+
+##### Expected Results
+
+- Each missing or mismatched target fails the AAP playbook without creating a resource or changing an image. A `state: patched` missing-resource warning alone is not accepted as success.
+- A missing or mismatched target is reported as a terminal upgrade failure rather than retried indefinitely; fulfillment releases `CanUpgrade` while Cluster and ClusterOrder provisioning state remain unchanged.
+- Each valid run changes only its selected resource's `spec.release.image`, confirms the value by readback, and leaves the other resource and all unrelated spec fields unchanged. Installation and post-install tasks do not run.
 
 ---
 
@@ -992,12 +1073,12 @@ All 9 interface changes are covered by test cases. No gaps.
 
 | Metric | Count |
 |--------|-------|
-| Total test cases | 44 |
-| Critical | 20 |
-| High | 14 |
+| Total test cases | 47 |
+| Critical | 21 |
+| High | 16 |
 | Medium | 7 |
 | Low | 3 |
-| Automated | 44 |
+| Automated | 47 |
 | Manual | 0 |
 | Requirements with test cases | 7 / 8 |
 | Interface changes with test cases | 9 / 9 |
