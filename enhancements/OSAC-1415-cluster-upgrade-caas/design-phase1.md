@@ -63,7 +63,7 @@ Phase 1 adds two independent upgrade paths to the OSAC cluster API:
 1. **CP upgrade:** tenant PATCHes `spec.version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.ReleaseImage`; operator detects HC image divergence and patches `HostedCluster.spec.release.image`.
 2. **NP upgrade:** tenant PATCHes `spec.node_sets[<id>].version`; fulfillment-service validates (including N-3 skew) and resolves to `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage`; operator detects NP image divergence and patches the specific `NodePool.spec.release.image`.
 
-Both paths bypass AAP. Fulfillment owns the `CanUpgrade` condition in its DB for initial HyperShift creation and upgrades: it sets `False` in the Cluster creation or upgrade-acceptance transaction and `True` in the transaction that records initial cluster readiness or a terminal upgrade result (success or failure). The osac-operator monitors HyperShift and reports status through the existing private Cluster Update path. ClusterOrder provisioning status is not changed by an upgrade.
+Both paths bypass AAP. Fulfillment sets each node set's desired `ClusterVersionReference` to the selected control-plane version during Cluster creation. It owns the `CanUpgrade` condition in its DB for initial HyperShift creation and upgrades: it sets `False` in the Cluster creation or upgrade-acceptance transaction and `True` in the transaction that records initial cluster readiness or a terminal upgrade result (success or failure). The osac-operator monitors HyperShift and reports status through the existing private Cluster Update path. ClusterOrder provisioning status is not changed by an upgrade.
 
 ### Workflow Description
 
@@ -94,8 +94,8 @@ osac-operator (clusterorder_controller.go)
  │  upgradeStatus.state = Pending
  ▼
 HyperShift Controller
- │  desired.version == target → upgradeStatus.state = Progressing
- │  history[0].state == Completed → upgradeStatus.state = Succeeded
+ │  desired.image == ClusterOrder.spec.ReleaseImage → Progressing
+ │  history[0].image == target; state == Completed → Succeeded
  ▼
 Status Feedback (feedback_controller.go)
  │  upgradeStatus → private Update → DB releases lock on successful completion or terminal upgrade failure
@@ -110,7 +110,7 @@ User
  │
  ▼
 CLI (upgrade_cmd.go / edit_cmd.go)
- │  gRPC: ClustersUpdateRequest spec.node_sets[i].version=4.16.5
+ │  gRPC: ClustersUpdateRequest spec.node_sets[i].version={name: "4-16-5"}
  │  update_mask: ["spec.node_sets"]
  ▼
 Fulfillment-Service API (clusters_server.go)
@@ -119,7 +119,7 @@ Fulfillment-Service API (clusters_server.go)
  │  3. PostgreSQL: persist spec.node_sets[i].version + CanUpgrade=False (atomic)
  ▼
 Cluster Reconciler (cluster_reconciler_function.go)
- │  buildSpec resolves ClusterVersion.spec.image from node_sets[i].version
+ │  buildSpec resolves ClusterVersion.spec.{image,version} from node_sets[i].version
  │  K8s PATCH: ClusterOrder.spec.nodeRequests[i].{ReleaseImage,Version}
  ▼
 osac-operator (clusterorder_controller.go)
@@ -129,7 +129,7 @@ osac-operator (clusterorder_controller.go)
  ▼
 HyperShift Controller
  │  conditions[UpdatingVersion]=True → upgradeStatus.state = Progressing
- │  UpdatingVersion=False + version==target → upgradeStatus.state = Succeeded
+ │  UpdatingVersion=False + version==nodeRequests[i].Version → Succeeded
  ▼
 Status Feedback (feedback_controller.go)
  │  upgradeStatus + observed_version → private Update → DB releases lock on successful completion or terminal upgrade failure
@@ -152,9 +152,9 @@ The CLI performs the following steps:
 
 1. Looks up the cluster by name or ID.
 2. Validates that `--version` is provided and exactly one of `--control-plane` or `--node-set` is specified.
-3. Resolves `--version` as `osac create cluster` does: match `ClusterVersion.metadata.name` or `ClusterVersion.spec.version`, preferring the name if both match different versions. Then clone and mutate the cluster proto (using the selected version's metadata name for CP and semantic version for NP):
+3. Resolves `--version` as `osac create cluster` does: match `ClusterVersion.metadata.name` or `ClusterVersion.spec.version`, preferring the name if both match different versions. Then clone and mutate the cluster proto (using the selected version's metadata name for both CP and NP references):
    - CP: `updated.GetSpec().SetVersion(publicv1.ClusterVersionReference_builder{Name: versionName}.Build())`
-   - NP: `updated.GetSpec().GetNodeSets()[nodeSetName].SetVersion(newVersion)`
+   - NP: `updated.GetSpec().GetNodeSets()[nodeSetName].SetVersion(publicv1.ClusterVersionReference_builder{Name: versionName}.Build())`
 4. Sends update with a field mask:
    ```go
    client.Update(ctx, publicv1.ClustersUpdateRequest_builder{
@@ -185,7 +185,7 @@ Before taking the Cluster row lock, look up and validate the target `ClusterVers
 | Check | CP | NP |
 |---|---|---|
 | `ClusterVersion` exists, enabled, not OBSOLETE | ✓ (DEPRECATED allowed) | ✓ |
-| target > observed current version | target > `observed_cp_version` | target > `node_sets[i].observed_version` |
+| target semver > observed current semver | target > `observed_cp_version` | target > `node_sets[i].observed_version` |
 | no downgrade | ✓ | ✓ |
 | version skew | CP target leaves no NP > 3 minor versions behind | target NP ≤ CP version; `CP_minor − NP_minor ≤ 3` |
 
@@ -205,7 +205,7 @@ As during cluster creation, the reconciler resolves the selected versions from t
 |---|---|
 | `spec.version` → `ClusterVersion.spec.image` | `spec.ReleaseImage` |
 | `spec.node_sets[i].version` → `ClusterVersion.spec.image` | `spec.nodeRequests[i].ReleaseImage` |
-| `spec.node_sets[i].version` | `spec.nodeRequests[i].Version` |
+| `spec.node_sets[i].version` → `ClusterVersion.spec.version` | `spec.nodeRequests[i].Version` |
 
 `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
 
@@ -231,7 +231,7 @@ If no image divergence exists and no upgrade is in flight, the existing `Desired
 
 After the HC or NP patch, the operator monitors for HyperShift's upgrade-started signal on each reconcile:
 
-- **CP:** `HC.status.controlPlaneVersion.desired.version == target_version` → set `upgradeStatus.state = Progressing`, `startTime = now`.
+- **CP:** `HC.status.controlPlaneVersion.desired.image == ClusterOrder.spec.ReleaseImage` with a nonempty `desired.version` → set `upgradeStatus.state = Progressing`, `toVersion = desired.version`, `startTime = now`.
 - **NP:** `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
 
 The feedback controller sends each `upgradeStatus` change through the private Cluster Update path, so the fulfillment-service reflects `Progressing` state promptly.
@@ -242,6 +242,7 @@ HyperShift's controllers perform the actual upgrade. The operator monitors for c
 
 **CP:** The cluster version operator (CVO) upgrades the control plane components. Completion criteria:
 - `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage`
+- `HC.status.controlPlaneVersion.history[0].version == HC.status.controlPlaneVersion.desired.version`
 - `HC.status.controlPlaneVersion.history[0].state == "Completed"`
 
 **NP:** The NodePool controller upgrades worker nodes to the target version. OSAC currently sets `spec.management.upgradeType: InPlace` on every HyperShift NodePool because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters. Completion criteria:
@@ -254,10 +255,10 @@ HyperShift's controllers perform the actual upgrade. The operator monitors for c
 
 On completion, the operator updates `ClusterOrder.status`:
 1. Sets `upgradeStatus.state = Succeeded`, `upgradeStatus.completionTime = now`.
-2. Sets `ObservedVersion` from `HC.status.controlPlaneVersion.history[0].version` (CP) or records `node_sets[i].observed_version` in the feedback payload (NP).
+2. Sets `ObservedVersion` from `HC.status.controlPlaneVersion.history[0].version` (CP) or records `node_sets[i].observed_version` from `NodePool[i].status.version` in the feedback payload (NP).
 3. Appends an `UpgradeHistoryEntry`.
 
-The feedback controller sends the status through the existing private Cluster Update path. Fulfillment persists `status.upgrade` and advances the observed CP or NP version on success. When feedback records `Succeeded` or terminal `Failed` for the current component and target version, the same DB transaction sets `conditions[CAN_UPGRADE]=True`; feedback for an earlier target cannot release the lock. A failed upgrade leaves the observed version unchanged. For initial cluster creation, fulfillment records cluster readiness (control plane and node pools) and sets `CanUpgrade=True` in one DB transaction while no upgrade is active. Incoming feedback cannot overwrite this DB-owned lock directly. The `Signal` RPC only queues reconciliation by cluster ID; it carries no status payload.
+The feedback controller sends the status through the existing private Cluster Update path. Fulfillment persists `status.upgrade` and advances the observed CP or NP version on success. All `from_version`, `to_version`, and observed-version status values are semver strings. The API records the resolved target semver at acceptance; private feedback preserves it when the operator reports `Pending` without `toVersion`, and checks any reported `toVersion` against it before recording progress or a terminal result. When feedback records `Succeeded` or terminal `Failed` for the current component and target version, the same DB transaction sets `conditions[CAN_UPGRADE]=True`; feedback for an earlier target cannot release the lock. A failed upgrade leaves the observed version unchanged. For initial cluster creation, fulfillment records cluster readiness, the control-plane and node-pool observed semver baselines, and `CanUpgrade=True` in one DB transaction while no upgrade is active. Incoming feedback cannot overwrite this DB-owned lock directly. The `Signal` RPC only queues reconciliation by cluster ID; it carries no status payload.
 
 ---
 
@@ -293,7 +294,7 @@ The feedback controller sends the status through the existing private Cluster Up
 │  1. Image divergence detected → upgrade path                        │
 │  2. upgradeStatus.state = Pending                                   │
 │  3. PATCH HC or NodePool spec.release.image                          │
-│  4. Monitor: desired.version==target / UpdatingVersion=True         │
+│  4. Monitor: CP desired.image==target / NP Updating=True            │
 │       → upgradeStatus.state = Progressing                           │
 │  5. Monitor target completion → upgradeStatus.state = Succeeded     │
 └────────────────────────┬────────────────────────────────────────────┘
@@ -346,18 +347,19 @@ stateDiagram-v2
 ClusterVersionReference version = 6;
 
 // ClusterNodeSet additions:
-string version = 5;           // desired NP version; settable via PATCH
-string observed_version = 6;  // output_only; from NodePool.status.version after upgrade
+ClusterVersionReference version = 5;  // desired NP version; set on Create, settable via PATCH
+string observed_version = 6;          // output_only; initial catalog semver, then NodePool.status.version
 
 // ClusterStatus additions:
-string observed_cp_version = 12;                   // output_only; from HC.status.controlPlaneVersion
+string observed_cp_version = 12;                   // output_only; initial catalog semver, then HC.status.controlPlaneVersion
 ClusterUpgradeStatus upgrade = 13;                 // output_only; active or most recent upgrade
 repeated ClusterVersionHistoryEntry version_history = 14;  // output_only
 
 // ClusterConditionType addition (the fulfillment DB owns this lock):
 CLUSTER_CONDITION_TYPE_CAN_UPGRADE = 5;
 
-// New messages:
+// New messages: all version strings in status/history are OpenShift semver
+// (for example, "4.21.2"), never ClusterVersion catalog names ("4-21-2").
 message ClusterUpgradeStatus {
     ClusterUpgradeProgressState state = 1;
     string from_version = 2;
@@ -441,31 +443,21 @@ const (
 )
 ```
 
+`ClusterVersionReference.name` remains in desired CP and node-set specs for catalog lookup and release-image resolution. CP target semver comes from the resolved `ClusterVersion.spec.version` at API acceptance and from `HostedCluster.status.controlPlaneVersion.desired.version` once its desired image matches the requested image. NP target semver comes from the resolved `ClusterVersion.spec.version` in `NodeRequest.Version`. `ClusterOrder` and `Cluster` status and history use those OpenShift semver values, including `FromVersion` and `ToVersion`.
+
 #### DB migration
 
-A numbered SQL migration backfills `status.observed_cp_version` from `spec.version.name` for existing clusters:
+A numbered SQL migration copies each existing Cluster's `spec.version` reference to every `spec.node_sets[*].version`. It resolves that reference by ID or scoped name and backfills `status.observed_cp_version` and every `status.node_sets[*].observed_version` from the immutable `ClusterVersion.spec.version` semver for ready Clusters. A catalog name such as `4-17-0` is not the observed semver `4.17.0`; an unresolved reference must leave `CanUpgrade=False`.
 
-```sql
-update clusters
-set data = jsonb_set(
-  coalesce(data, '{}'::jsonb),
-  '{status,observed_cp_version}',
-  to_jsonb(data->'spec'->'version'->>'name')
-)
-where data->'spec'->'version'->'name' is not null
-  and (data->'status'->>'observed_cp_version' is null
-       or data->'status'->>'observed_cp_version' = '');
-```
+No new tables; changes are to the JSONB `data` column. Fulfillment creates new Clusters with DB-owned `CAN_UPGRADE=False` and node-set version references in the same transaction. For existing Clusters, the numbered migration uses one atomic SQL `UPDATE` to store the version baselines and set exactly one `CAN_UPGRADE` condition: `True` only when persisted `status.conditions[READY].status=True` and all baselines are stored, `False` otherwise, preserving other conditions. `READY` reflects `ClusterOrder`'s `ClusterAvailable` condition and can be `True` while its phase is `Progressing`.
 
-No new tables; changes are to the JSONB `data` column. Fulfillment creates new Clusters with DB-owned `CAN_UPGRADE=False` in the same transaction. For existing Clusters, the numbered migration uses one atomic SQL `UPDATE` to set exactly one `CAN_UPGRADE` condition: `True` when persisted `status.conditions[READY].status=True`, `False` otherwise, preserving other conditions. `READY` reflects `ClusterOrder`'s `ClusterAvailable` condition and can be `True` while its phase is `Progressing`.
-
-Current design phase will accept **the following caveat**: The condition does not prove every NodePool is ready or that requested versions have converged, so the migration can unlock a Cluster whose workers are still converging.
+Current design phase will accept **the following caveat**: The condition does not prove every NodePool is ready or that requested versions have converged, so the migration can unlock a Cluster whose workers are still converging. Before the first upgrade, provisioning uses the same release image for the HostedCluster and every NodePool.
 
 ### Implementation Details
 
 #### Version validation in fulfillment-service
 
-Resolve and validate the target `ClusterVersion` before taking the Cluster row lock. Use a non-locking read of the stored Cluster to check the version reference's scope, including shared versions; the later locked read is authoritative for upgrade state and skew. Like cluster provisioning, the catalog read uses the request transaction but does not lock the `ClusterVersion`. Check `enabled` and `state` when reading it, then use its immutable `version` for validation. The reconciler looks up its immutable `image` when building the `ClusterOrder`.
+Resolve and validate the target `ClusterVersion` before taking the Cluster row lock. Use a non-locking read of the stored Cluster to check the version reference's scope, including shared versions; the later locked read is authoritative for upgrade state and skew. Like cluster provisioning, the catalog read uses the request transaction but does not lock the `ClusterVersion`. Check `enabled` and `state` when reading it, then use its immutable `version` for validation. All ordering and skew checks parse and compare that semver with persisted observed semver fields, never with `ClusterVersionReference.name`. The reconciler looks up its immutable `image` when building the `ClusterOrder`.
 
 `validateUpgradeEligibility` (new, called after the row lock):
 1. Reject with `FAILED_PRECONDITION` if `state ∈ {DELETING, DELETE_FAILED, FAILED}`.
@@ -486,13 +478,13 @@ Resolve and validate the target `ClusterVersion` before taking the Cluster row l
 3. Target semver ≤ `status.observed_cp_version`. NP version must not exceed CP version (including patch).
 4. `CP_minor - target_NP_minor ≤ 3`. N-3 minor version skew constraint.
 
-After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested version, `status.upgrade=Pending`, and `CanUpgrade=False` in one transaction. Private status feedback updates `status.upgrade`; fulfillment restores `CanUpgrade=True` in the transaction that records `Succeeded` or terminal `Failed`.
+After locking the Cluster row, run `validateUpgradeEligibility` and the observed-version and skew checks against the masked request. If `CanUpgrade` is no longer `True`, return `FAILED_PRECONDITION`. Otherwise, save the requested reference, `status.upgrade=Pending` with the resolved target semver, and `CanUpgrade=False` in one transaction. Private status feedback updates `status.upgrade`; fulfillment restores `CanUpgrade=True` in the transaction that records `Succeeded` or terminal `Failed`.
 
 For version updates, move the `validateClusterStateForSpecUpdate` state check after the catalog lookup and into the locked update path. Other spec updates keep its current behavior.
 
 #### Upgrade lock ownership
 
-Fulfillment initializes `CanUpgrade=False` in the same transaction that creates the Cluster. For initial provisioning, the feedback controller sends the existing `ClusterAvailable` observation as `Cluster.status.conditions[READY]` through private Cluster Update. Fulfillment locks the Cluster row and stores `READY=True` with `CanUpgrade=True` in one transaction only while `status.upgrade` is unset. Later HC/NP health changes do not change the lock.
+Fulfillment initializes `CanUpgrade=False` and copies the selected `spec.version` reference to every `spec.node_sets[*].version` in the same transaction that creates the Cluster; a node-set reference resolving to a different ClusterVersion on Create is rejected. For initial provisioning, the feedback controller sends the existing `ClusterAvailable` observation as `Cluster.status.conditions[READY]` through private Cluster Update. Fulfillment locks the Cluster row and stores `READY=True`, `status.observed_cp_version`, every `status.node_sets[*].observed_version`, and `CanUpgrade=True` in one transaction only while `status.upgrade` is unset. The observed baselines come from the selected `ClusterVersion.spec.version`; provisioning changes status, not the desired references. Later HC/NP health changes do not change the lock.
 
 For an upgrade, the API stores the target and takes the DB lock in one acceptance transaction. The operator patches HC/NP while `CanUpgrade=False` and reports progress through private status feedback. The private Cluster Update handler releases the DB lock in the transaction that records success or terminal failure for the current component and target version.
 
@@ -500,7 +492,7 @@ For an upgrade, the API stores the target and takes the DB lock in one acceptanc
 
 `buildSpec` in `fulfillment-service/internal/controllers/cluster/cluster_reconciler_function.go`:
 - Resolves `Cluster.spec.version` to `ClusterVersion.spec.image`, as during creation, and sets `ClusterOrder.spec.ReleaseImage` (CP image).
-- Resolves each specified `Cluster.spec.node_sets[<id>].version` by `ClusterVersion.spec.version` and sets `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage` (pullspec) and `ClusterOrder.spec.nodeRequests[<id>].Version` (semver). No resolved image is stored on `Cluster`.
+- Resolves each `Cluster.spec.node_sets[<id>].version` reference to `ClusterVersion.spec.image` and `ClusterVersion.spec.version`, then sets `ClusterOrder.spec.nodeRequests[<id>].ReleaseImage` (pullspec) and `ClusterOrder.spec.nodeRequests[<id>].Version` (semver). No resolved image is stored on `Cluster`.
 - `ReleaseImage`, `nodeRequests[*].ReleaseImage`, and `nodeRequests[*].Version` are excluded from `DesiredConfigVersion` hash computation to prevent triggering AAP re-provision when only version fields change.
 
 #### osac-operator upgrade reconciliation
@@ -509,19 +501,19 @@ In `clusterorder_controller.go`, the reconcile loop gains upgrade awareness:
 
 **CP upgrade path:**
 1. Compare `ClusterOrder.spec.ReleaseImage` with `HostedCluster.spec.release.image`. If HC exists and images differ → CP upgrade path.
-2. Set `upgradeStatus = {state: Pending, component: "control_plane", fromVersion: observedVersion, toVersion: spec.version.name}`.
+2. Set `upgradeStatus = {state: Pending, component: "control_plane", fromVersion: observedVersion}`; fulfillment retains the accepted target semver while HyperShift has not reported it.
 3. Patch `HostedCluster.spec.release.image = ClusterOrder.spec.ReleaseImage`; state remains `Pending`.
-4. Monitor: when `HC.status.controlPlaneVersion.desired.version == target_version` → set `upgradeStatus.state = Progressing`, `startTime = now`.
-5. Monitor completion: `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage` AND `history[0].state == "Completed"`.
+4. Monitor: when `HC.status.controlPlaneVersion.desired.image == ClusterOrder.spec.ReleaseImage` and `desired.version` is nonempty → set `upgradeStatus.state = Progressing`, `toVersion = desired.version`, `startTime = now`; fulfillment checks that semver against the accepted target.
+5. Monitor completion: `HC.status.controlPlaneVersion.history[0].image == ClusterOrder.spec.ReleaseImage`, `history[0].version == HC.status.controlPlaneVersion.desired.version`, AND `history[0].state == "Completed"`.
 6. On completion: set `status.observedVersion` from `HC.status.controlPlaneVersion.history[0].version`; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
 **NP upgrade path:**
 1. Compare `ClusterOrder.spec.nodeRequests[i].ReleaseImage` with `NodePool[i].spec.release.image`. If NP exists and images differ → NP upgrade path for that pool.
-2. Set `upgradeStatus = {state: Pending, component: "node_pool:<id>", fromVersion: observed, toVersion: target}`.
+2. Set `upgradeStatus = {state: Pending, component: "node_pool:<id>", fromVersion: observed, toVersion: nodeRequests[i].Version}`.
 3. Patch `NodePool[i].spec.release.image = nodeRequests[i].ReleaseImage`; state remains `Pending`.
 4. Monitor: when `NodePool[i].status.conditions[UpdatingVersion].status == True` → set `upgradeStatus.state = Progressing`, `startTime = now`.
 5. Monitor completion: `NodePool[i].status.conditions[UpdatingVersion].status == False` AND `NodePool[i].status.version == ClusterOrder.spec.nodeRequests[i].Version`.
-6. On completion: set `node_sets[i].observed_version` in the feedback payload; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
+6. On completion: set `node_sets[i].observed_version` from `NodePool[i].status.version` in the feedback payload; append `UpgradeHistoryEntry`; set `upgradeStatus.state = Succeeded`. ClusterOrder phase is not changed.
 
 **Provision path** (unchanged): if HC does not yet exist or no image divergence on HC or any NP, the existing `DesiredConfigVersion` hash comparison drives AAP provisioning.
 
@@ -539,12 +531,13 @@ NodePools are discovered by listing within the cluster's namespace by `osac.open
 |---------|-------|-------|
 | Initial provisioning confirmation | `Cluster.status.conditions[READY].status == True` | Mapped from `ClusterOrder.conditions[ClusterAvailable]`; releases the DB lock even while phase is Progressing |
 | HC version completion | `HC.status.controlPlaneVersion.history[0].image` | Must equal `ClusterOrder.spec.ReleaseImage` |
+| HC version completion | `HC.status.controlPlaneVersion.history[0].version` | Must equal `HC.status.controlPlaneVersion.desired.version` |
 | HC version completion | `HC.status.controlPlaneVersion.history[0].state` | Must equal `"Completed"` |
 | NP upgrade completion | `NodePool.status.version` | The upgraded NP must match its requested version |
 | CP current version | `HC.status.controlPlaneVersion.history` (first `Completed` entry) | Semver string |
 | CP upgrade in progress | `controlPlaneVersion.history[0].state == Partial` | No `completionTime` |
 | CP target during upgrade | `controlPlaneVersion.desired.version` | Display as "upgrading to X" |
-| CP upgrade started signal | `HC.status.controlPlaneVersion.desired.version == target_version` | Pending → Progressing transition for CP |
+| CP upgrade started signal | `HC.status.controlPlaneVersion.desired.image == ClusterOrder.spec.ReleaseImage` and nonempty `desired.version` | Pending → Progressing; fulfillment confirms the reported semver against the accepted target |
 | NP upgrade started signal | `NodePool.status.conditions[UpdatingVersion].status == True` | Pending → Progressing transition for NP |
 | CP history | `controlPlaneVersion.history[]` | maxItems: 100 |
 | NP current version | `NodePool.status.version` | Flat semver string |
@@ -615,7 +608,7 @@ NP-only upgrades (worker nodes catching up to an already-running CP version) lik
 
 ### 9.2 Node-pool version deletion protection — Deferred
 
-Release images are resolved from `ClusterVersion` during reconciliation. The existing deletion protection covers the control-plane `spec.version` reference, but not the proposed `node_sets[*].version` semver string. How should node-pool versions be protected from deletion while in use? Extending that protection is deferred to follow-up work.
+Release images are resolved from `ClusterVersion` during reconciliation. The existing deletion protection covers the control-plane `spec.version` reference, but not the proposed `node_sets[*].version` references. How should node-pool versions be protected from deletion while in use? Extending that protection is deferred to follow-up work.
 
 ## Test Plan
 
@@ -631,7 +624,7 @@ The test strategy follows the touched-area map for `fulfillment-service` and `os
 
 **Integration tests:**
 - CP upgrade end-to-end: PATCH spec.version → CanUpgrade=False (sync DB write) → ClusterOrder sync → operator patches HC → completion detected → CanUpgrade=True + history entry.
-- Initial creation: Cluster and `CanUpgrade=False` are stored together; `READY=True` feedback stores `CanUpgrade=True` while ClusterOrder may still be `Progressing`.
+- Initial creation and migration: node-set version references and `CanUpgrade=False` are stored with the Cluster; `READY=True` feedback or migration stores all observed semver baselines with `CanUpgrade=True` while ClusterOrder may still be `Progressing`.
 - NP upgrade end-to-end: PATCH spec.node_sets[i].version → CanUpgrade=False (sync DB write) → NP patched → NP completion → CanUpgrade=True + per-NP observed_version.
 - Blocking guard: reject upgrade request on DELETING, DELETE_FAILED, FAILED clusters; reject when CanUpgrade=False.
 - Concurrent upgrades to one cluster: one succeeds; the other returns FAILED_PRECONDITION. Verify the stored version matches the winner, `CanUpgrade=False`, and the reconciled `ClusterOrder` image matches that version.
@@ -651,7 +644,7 @@ The test strategy follows the touched-area map for `fulfillment-service` and `os
 
 ## Upgrade / Downgrade Strategy
 
-A DB migration backfills `observed_cp_version` for pre-existing clusters (see SQL in API Extensions). The new `ClusterStatus` fields are additive and backward-compatible. The `ReleaseImage` hash exclusion is a behavioral change to the provisioning path; it must be validated on rollout to prevent spurious AAP re-provision jobs.
+A DB migration backfills observed semver versions for pre-existing ready clusters (see DB migration in API Extensions). The new `ClusterStatus` fields are additive and backward-compatible. The `ReleaseImage` and node-request version hash exclusions are behavioral changes to the provisioning path; they must be validated on rollout to prevent spurious AAP re-provision jobs.
 
 ## Version Skew Strategy
 

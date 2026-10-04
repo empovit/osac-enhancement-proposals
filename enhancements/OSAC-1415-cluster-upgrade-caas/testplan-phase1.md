@@ -7,6 +7,8 @@
 - **Requirements with test cases:** 7 of 8 (FR-7, FR-8, FR-10, FR-11, FR-12, FR-13, NFR-1); NFR-2 is documentation
 - **Interface changes covered:** 9 of 9 (IC-1 through IC-9)
 
+PATCH steps below use semantic versions as shorthand; CP and NP desired versions are both `ClusterVersionReference` values on the wire, while observed versions are semver strings.
+
 ---
 
 ## Test Cases
@@ -25,7 +27,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Preconditions
 
-- Cluster in `CLUSTER_STATE_READY`. `status.observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` is ACTIVE.
+- Cluster in `CLUSTER_STATE_READY`. `status.observed_cp_version = "4.16.5"`. Target ClusterVersion has `metadata.name = "4-17-3"`, `spec.version = "4.17.3"`, and is ACTIVE.
 
 ##### Steps
 
@@ -45,7 +47,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ---
 
-#### TC-FR7-01b: CP upgrade completion requires target image in HC history
+#### TC-FR7-01b: CP upgrade completion requires target image and semver in HC history
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -53,19 +55,21 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Preconditions
 
-- CP upgrade to `4.17.3` in progress (`conditions[CAN_UPGRADE].status = False`). `HC.status.controlPlaneVersion.history[0].state = "Partial"` (upgrade in progress).
+- CP upgrade to `4.17.3` in progress (`conditions[CAN_UPGRADE].status = False`). `HC.status.controlPlaneVersion.desired.image = ClusterOrder.spec.ReleaseImage`, `desired.version = "4.17.3"`, and `history[0].state = "Partial"`.
 
 ##### Steps
 
 1. Simulate `HC.status.controlPlaneVersion.history[0].state = "Completed"` but `history[0].image` still names the previous release image.
 2. `GET /clusters/{id}`.
-3. Simulate `HC.status.controlPlaneVersion.history[0].image = ClusterOrder.spec.ReleaseImage`, `version = "4.17.3"`, and `state = "Completed"`.
-4. `GET /clusters/{id}`.
+3. Simulate `HC.status.controlPlaneVersion.history[0].image = ClusterOrder.spec.ReleaseImage`, but `version = "4.17.2"` and `state = "Completed"`; GET the Cluster.
+4. Simulate `HC.status.controlPlaneVersion.history[0].version = "4.17.3"`.
+5. `GET /clusters/{id}`.
 
 ##### Expected Results
 
 - After step 2: `conditions[CAN_UPGRADE].status = False` — completion is not declared while the completed history image differs from the requested target.
-- After step 4: `conditions[CAN_UPGRADE].status = True`, `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `status.observed_cp_version = "4.17.3"`.
+- After step 3: `conditions[CAN_UPGRADE].status = False` while the completed history version differs from HyperShift's `desired.version = "4.17.3"`.
+- After step 5: `conditions[CAN_UPGRADE].status = True`, `status.upgrade.state = CLUSTER_UPGRADE_PROGRESS_STATE_SUCCEEDED`, `status.observed_cp_version = "4.17.3"`.
 
 ---
 
@@ -122,7 +126,7 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Preconditions
 
-- NP `workers` upgrade to `4.17.3` in progress (`conditions[CAN_UPGRADE].status = False`). `NodePool["workers"].status.conditions[UpdatingVersion].status = True`.
+- NP `workers` upgrade to `4.17.3` in progress (`conditions[CAN_UPGRADE].status = False`). Its desired reference name is `4-17-3`, `ClusterOrder.spec.nodeRequests["workers"].Version = "4.17.3"`, and `NodePool["workers"].status.conditions[UpdatingVersion].status = True`.
 
 ##### Steps
 
@@ -225,7 +229,7 @@ FR-13 requires a record of past version transitions surfaced in cluster status.
 
 ##### Expected Results
 
-- `status.version_history` contains one entry: `from_version = "4.16.5"`, `to_version = "4.17.3"`, `success = true`, `completed_at` is non-zero and matches `status.upgrade.completed_at`.
+- `status.version_history` contains one entry: `from_version = "4.16.5"`, `to_version = "4.17.3"` (OpenShift semver, not catalog name `4-17-3`), `success = true`, `completed_at` is non-zero and matches `status.upgrade.completed_at`.
 
 ---
 
@@ -429,7 +433,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- A new Cluster was stored with `CAN_UPGRADE=False` in its creation transaction. `CLUSTER_STATE_PROGRESSING` persists while AAP post-provisioning tasks run. `ClusterOrder.conditions[ClusterAvailable]=True`, but Cluster `READY=True` feedback has not yet been stored. `observed_cp_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE.
+- A new Cluster with two node sets and selected ClusterVersion `spec.version="4.16.5"` was stored with `CAN_UPGRADE=False` in its creation transaction. `CLUSTER_STATE_PROGRESSING` persists while AAP post-provisioning tasks run. `ClusterOrder.conditions[ClusterAvailable]=True`, but Cluster `READY=True` feedback has not yet been stored. Observed versions are empty. ClusterVersion `4.17.3` ACTIVE.
 
 ##### Steps
 
@@ -438,7 +442,8 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- Step 1 stores `READY=True` and `CAN_UPGRADE=True` in one transaction while Cluster state remains `PROGRESSING`.
+- Create stored both desired node-set version references equal to the selected CP reference with `CAN_UPGRADE=False` in one transaction.
+- Step 1 stores `READY=True`, the CP and both node-set observed semver baselines (`"4.16.5"`), and `CAN_UPGRADE=True` in one transaction while Cluster state remains `PROGRESSING`.
 - Step 2 returns HTTP 200 and stores the upgrade target with `CAN_UPGRADE=False` in one transaction.
 
 ---
@@ -816,7 +821,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- Exit code 0. Stdout shows the cluster resource (state unchanged, `can_upgrade: false`). PATCH request body contains `spec.version.name = "4.17.3"`.
+- Exit code 0. Stdout shows the cluster resource (state unchanged, `can_upgrade: false`). PATCH request body contains `spec.version.name = "4-17-3"`.
 
 ---
 
@@ -858,7 +863,7 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- Exit code 0. Stdout shows the cluster resource (state unchanged, `can_upgrade: false`). PATCH request body contains `spec.node_sets["workers"].version = "4.17.3"`.
+- Exit code 0. Stdout shows the cluster resource (state unchanged, `can_upgrade: false`). PATCH request body contains `spec.node_sets["workers"].version.name = "4-17-3"`, the same reference type used for CP upgrades.
 
 ---
 
