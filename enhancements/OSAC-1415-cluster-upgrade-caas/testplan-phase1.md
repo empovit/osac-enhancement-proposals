@@ -9,12 +9,14 @@
 
 PATCH steps below use semantic versions as shorthand; CP and NP desired versions are both `ClusterVersionReference` values on the wire, while observed versions are semver strings.
 
+For NP cases, the public target is a CaaS node-set name. Current implementation maps it to a `NodeRequest` by resource class and then to a HyperShift NodePool by its `osac.openshift.io/resource_class` label. Targeting cases use different node-set and NodePool names so an index- or name-based lookup cannot pass accidentally. [OSAC-1604](https://redhat.atlassian.net/browse/OSAC-1604) may change this mapping; update these cases to match its delivered identity when it lands.
+
 ### Upgrade-path coverage and ownership
 
 | Behavior / cases | Tier and owner | Boundary and execution evidence |
 |---|---|---|
-| Upgrade-mode routing, job idempotency, feedback (`TC-IC1-01`, `TC-IC1-01c`, `TC-IC2-01`, `TC-FR7-01`) | Envtest, osac-operator `[DEV]` | `make test` in `osac-operator/`; real Kubernetes API and controller, fake AAP client and simulated HyperShift status. This does not prove the AAP service boundary. |
-| Shared HC/NP image patch, missing-target failure, later scale preserving per-NP image (`TC-IC1-01`, `TC-IC2-01`, `TC-IC2-01b`, `TC-IC2-01c`) | Component integration, osac-aap `[DEV]` | Proposed target under `osac-aap/tests/integration/targets/`, run by `make test` in `osac-aap/`; real Kind API and Ansible tasks, no real AAP controller or HyperShift reconciliation. |
+| Upgrade-mode routing, resource-class selection, job idempotency, feedback (`TC-IC1-01`, `TC-IC1-01c`, `TC-IC2-01`, `TC-FR7-01`, `TC-FR7-03b`) | Envtest, osac-operator `[DEV]` | `make test` in `osac-operator/`; real Kubernetes API and controller, fake AAP client and simulated HyperShift status. This does not prove the AAP service boundary. |
+| Shared HC/NP image patch, unique target validation, later scale preserving per-NP image (`TC-IC1-01`, `TC-IC2-01`, `TC-IC2-01b`, `TC-IC2-01c`) | Component integration, osac-aap `[DEV]` | Proposed target under `osac-aap/tests/integration/targets/`, run by `make test` in `osac-aap/`; real Kind API and Ansible tasks, no real AAP controller or HyperShift reconciliation. |
 | AAP template launch, polling, and retry (`TC-IC1-01c`) | Contract, osac-operator/osac-aap `[DEV]` | No qualifying real-AAP contract suite is currently identified; follow [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). A fake AAP client in Envtest covers caller logic only. |
 | Deployed CP/NP upgrade and later scale (`TC-IC1-01`, `TC-IC2-01`, `TC-IC2-01b`) | E2E, `[QE]` | Proposed cases under `tests/e2e/` require deployed fulfillment-service, operator, AAP, and HyperShift; execution command and environment are unresolved pending the provider test setup in [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). |
 
@@ -137,13 +139,13 @@ FR-7 requires upgrade state (progressing/succeeded/failed), source and target ve
 
 ##### Preconditions
 
-- NP `workers` upgrade to `4.17.3` in progress (`conditions[CAN_UPGRADE].status = False`). Its desired reference name is `4-17-3`, `ClusterOrder.spec.nodeRequests["workers"].Version = "4.17.3"`, and `NodePool["workers"].status.conditions[UpdatingVersion].status = True`.
+- NP upgrade for node set `workers` to `4.17.3` is in progress (`conditions[CAN_UPGRADE].status = False`). Its resource class is `gpu` and its desired reference name is `4-17-3`. The `NodeRequest` with `ResourceClass="gpu"` has `Version="4.17.3"`; NodePool `pool-a` has `osac.openshift.io/resource_class=gpu` and `status.conditions[UpdatingVersion].status = True`.
 
 ##### Steps
 
-1. Simulate `NodePool["workers"].status.conditions[UpdatingVersion].status = False` but `NodePool["workers"].status.version = "4.17.2"` (version mismatch).
+1. Simulate `pool-a.status.conditions[UpdatingVersion].status = False` but `pool-a.status.version = "4.17.2"` (version mismatch).
 2. `GET /clusters/{id}`.
-3. Simulate `NodePool["workers"].status.version = "4.17.3"` with `UpdatingVersion=False`.
+3. Simulate `pool-a.status.version = "4.17.3"` with `UpdatingVersion=False`.
 4. `GET /clusters/{id}`.
 
 ##### Expected Results
@@ -615,16 +617,19 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Preconditions
 
-- Cluster `READY`. `observed_cp_version = "4.17.3"`. Node pool `workers` at `observed_version = "4.16.5"`. ClusterVersion `4.17.3` ACTIVE. Cluster has two node pools.
+- Cluster `READY`. `observed_cp_version = "4.17.3"`. Node set `workers` uses resource class `gpu` and has `observed_version = "4.16.5"`; the other node set uses `cpu`. Their existing NodePools are named `pool-a` (`osac.openshift.io/resource_class=gpu`) and `pool-b` (`osac.openshift.io/resource_class=cpu`), deliberately different from the node-set names. ClusterVersion `4.17.3` is ACTIVE.
 
 ##### Steps
 
 1. `PATCH /clusters/{id}` `spec.node_sets["workers"].version = "4.17.3"`.
 2. Reconcile the ClusterOrder and run the existing cluster AAP job in upgrade mode for the NP upgrade.
+3. Simulate `pool-a` completing at `4.17.3`, deliver private status feedback, and read the public Cluster.
 
 ##### Expected Results
 
-- HTTP 200. The `ClusterOrder` carries the image from ClusterVersion `4.17.3` for the NP upgrade. The operator launches the configured create-hosted-cluster AAP template once in upgrade mode and does not patch the NP itself. The playbook verifies the existing NodePool's ClusterOrder association, patches only its `spec.release.image`, and reads it back to confirm the target image. Install/post-install tasks do not run, and `HostedCluster.spec.release.image`, the other NodePool image, and other NP fields do not change. Cluster state is unchanged; `conditions[CAN_UPGRADE].status = False` is written in the acceptance transaction.
+- After step 1: HTTP 200, cluster state unchanged, and `conditions[CAN_UPGRADE].status = False` written in the acceptance transaction.
+- After step 2: The `NodeRequest` with `ResourceClass="gpu"` receives the image from ClusterVersion `4.17.3`; the `cpu` request is unchanged. The operator selects `pool-a` by its resource-class label and launches the configured create-hosted-cluster AAP template once in upgrade mode with internal component `node_pool:gpu`. The playbook confirms a unique associated `gpu` NodePool, patches only `pool-a.spec.release.image`, and reads it back. Install/post-install tasks do not run, and the HostedCluster image, `pool-b` image, and other NP fields do not change.
+- After step 3: Public `status.upgrade.component` and the new history entry use `node_pool:workers`; only `status.node_sets["workers"].observed_version` advances to `4.17.3`. `conditions[CAN_UPGRADE].status = True`, and cluster provisioning state is unchanged.
 
 ---
 
@@ -645,11 +650,11 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 ##### Expected Results
 
-- Scaling changes the replica count without resetting `workers.spec.release.image` from `4.17.3` to the CP's `4.18.0` image. The HC and other NP images remain unchanged, and no upgrade job is launched for the scale-only change.
+- Scaling changes the replica count without resetting the NodePool matched to `workers` from the `4.17.3` image to the CP's `4.18.0` image. The HC and other NP images remain unchanged, and no upgrade job is launched for the scale-only change.
 
 ---
 
-#### TC-IC2-01c: Shared upgrade patch fails for missing or mismatched HC and NP
+#### TC-IC2-01c: Shared upgrade patch fails for missing, ambiguous, or mismatched targets
 
 | Interface Change | Priority | Automation |
 |-----------------|----------|------------|
@@ -663,12 +668,13 @@ NFR-1 requires that the API surface supports UI display of upgrade state, histor
 
 1. Run the shared upgrade patch with the selected HC absent; repeat with the selected NP absent.
 2. Create HC and NP resources with a mismatched ClusterOrder association, then repeat each patch.
-3. Run the CP and NP patches against correctly associated resources, then read both resources.
+3. For an NP upgrade, provide two associated NodePools with the selected resource-class label; repeat with no NodePool carrying that label.
+4. Run the CP and NP patches against correctly associated resources with exactly one matching NP, then read both resources.
 
 ##### Expected Results
 
-- Each missing or mismatched target fails the AAP playbook without creating a resource or changing an image. A `state: patched` missing-resource warning alone is not accepted as success.
-- A missing or mismatched target is reported as a terminal upgrade failure rather than retried indefinitely; fulfillment releases `CanUpgrade` while Cluster and ClusterOrder provisioning state remain unchanged.
+- Each missing, ambiguous, or mismatched target fails the AAP playbook without creating a resource or changing an image. A `state: patched` missing-resource warning alone is not accepted as success.
+- A target-validation failure is reported as a terminal upgrade failure rather than retried indefinitely; fulfillment releases `CanUpgrade` while Cluster and ClusterOrder provisioning state remain unchanged.
 - Each valid run changes only its selected resource's `spec.release.image`, confirms the value by readback, and leaves the other resource and all unrelated spec fields unchanged. Installation and post-install tasks do not run.
 
 ---

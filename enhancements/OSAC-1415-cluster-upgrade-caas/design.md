@@ -65,9 +65,17 @@ timeline
 
 ### Phase 1 — Independent upgrades
 
-Control plane and node pools are upgraded independently and sequentially. As with scaling, the operator launches the existing cluster AAP job. For an upgrade, its update-only branch patches `spec.release.image` on the target existing `HostedCluster` or `NodePool` and skips installation and post-install work. All NodePools in OSAC-provisioned HyperShift clusters currently use `spec.management.upgradeType: InPlace` because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters. Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades; either terminal upgrade result (success or failure) releases it without changing ClusterOrder provisioning status. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
+Control plane and node pools are upgraded independently and sequentially. As with scaling, the operator launches the existing cluster AAP job. For an upgrade, its update-only branch patches `spec.release.image` on the target existing `HostedCluster` or `NodePool` and skips installation and post-install work. All NodePools in OSAC-provisioned HyperShift clusters currently use `spec.management.upgradeType: InPlace` because their nodes are bare metal; this choice may change when OSAC supports OpenShift Virtualization-backed clusters.
+
+Fulfillment owns the `CanUpgrade` DB lock for initial creation and upgrades; either terminal upgrade result (success or failure) releases it without changing ClusterOrder provisioning status. Version skew (NP ≤ CP, within N-3 minor versions) is enforced at the API layer.
 
 Upgrades are triggered through `osac edit cluster`, a new `osac upgrade cluster` command, or directly via `PATCH /clusters/{id}`.
+
+#### Current NodePool targeting
+
+The tenant selects a CaaS node set by name. Fulfillment finds that node set's resource class and updates the matching `ClusterOrder.spec.nodeRequests` entry. The operator matches that `NodeRequest.ResourceClass` to the existing NodePool's `osac.openshift.io/resource_class` label, then targets only that pool through AAP. Current readiness checks reject duplicate node-request resource classes and duplicate NodePool labels for one class, making this mapping unique for a ready cluster; neither list position nor the node-set name identifies a NodePool.
+
+[OSAC-1604](https://redhat.atlassian.net/browse/OSAC-1604) is scheduled to change node-set/NodePool identity. When its mapping is available, the OSAC-1415 implementation and tests must use it for NodePool selection and status attribution. Phase 1 does not prescribe that future mapping. See `design-phase1.md` for the current flow.
 
 See `design-phase1.md` for the full specification.
 
