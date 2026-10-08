@@ -3,7 +3,7 @@ title: cluster-upgrade-caas-phase1
 authors:
   - vemporop@redhat.com
 creation-date: 2026-09-22
-last-updated: 2026-10-06
+last-updated: 2026-10-08
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-1415
 prd:
@@ -206,7 +206,7 @@ Phase 1 does not query the OpenShift Update Service (OSUS) for upgrade-graph rea
 
 The upgrade path preserves existing tenant isolation. The tenant's existing `Update` permission on its `Cluster` gates requests; `ClusterOrder` retains the `osac.openshift.io/tenant` annotation and existing OPA isolation.
 
-The osac-operator retains read-only access to `HostedCluster` and NodePool resources. The existing AAP cluster execution identity performs the patch after checking the target's namespace and `ClusterOrder` association. No new permissions or OPA policies are required.
+The osac-operator retains read-only access to `HostedCluster` resources and its existing NodePool replica patch permission; it does not patch release images. The existing AAP cluster execution identity performs the image patch after checking the target's namespace and `ClusterOrder` association. No new permissions or OPA policies are required.
 
 ### Drawbacks
 
@@ -218,7 +218,7 @@ Serializing upgrades per cluster means different node pools must wait for one an
 
 **Health-based upgrade gate:** `CanUpgrade` could be updated continuously from cluster health, such as degradation. However, this design uses it only to serialize user-initiated operations that affect upgrades; cluster health and upgrade status remain independent, so a later health change does not change the gate.
 
-**Direct operator patching:** The operator could update HyperShift images itself. That would require write access and a second mutation path alongside AAP. The design keeps one controlled path.
+**Direct operator patching:** The operator could update HyperShift images itself. That would require HostedCluster patch access and a second image mutation path alongside AAP. The [upgrade execution alternatives](upgrade-execution-alternatives.md) record the concurrency issues and work needed to revisit this option.
 
 ## Test Plan
 
